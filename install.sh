@@ -4,6 +4,10 @@
 # =============================================================================
 set -e
 
+# Non-interactive mode for apt / dpkg (Suppress pending kernel & restart dialogs)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
 INSTALL_DIR="$HOME/.hermes-agent"
 CONFIG_DIR="$HOME/.hermes"
 LOCAL_BIN="$HOME/.local/bin/hermes"
@@ -14,9 +18,9 @@ SYS_BIN="/usr/local/bin/hermes"
 # -----------------------------------------------------------------------------
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
-        "$@"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "$@"
     elif command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
+        sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "$@"
     else
         "$@" || true
     fi
@@ -88,7 +92,7 @@ echo ""
 echo "▶ [Group 1/5] Checking & Installing OS Toolchain..."
 if command -v apt-get >/dev/null 2>&1; then
     run_privileged apt-get update -y
-    run_privileged apt-get install -y software-properties-common git curl sqlite3 libffi-dev libssl-dev ripgrep nodejs npm build-essential
+    run_privileged apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" software-properties-common git curl sqlite3 libffi-dev libssl-dev ripgrep nodejs npm build-essential
 elif command -v dnf >/dev/null 2>&1; then
     run_privileged dnf install -y gcc git curl sqlite sqlite-devel ripgrep nodejs npm make
 elif command -v yum >/dev/null 2>&1; then
@@ -118,7 +122,7 @@ if command -v apt-get >/dev/null 2>&1; then
         echo "  Adding deadsnakes PPA for Python 3.11..."
         run_privileged add-apt-repository -y ppa:deadsnakes/ppa || true
         run_privileged apt-get update -y || true
-        run_privileged apt-get install -y python3.11 python3.11-venv python3.11-dev python3.11-distutils
+        run_privileged apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" python3.11 python3.11-venv python3.11-dev python3.11-distutils
     fi
 elif command -v dnf >/dev/null 2>&1; then
     run_privileged dnf install -y python3.11 python3.11-devel python3.11-pip || true
