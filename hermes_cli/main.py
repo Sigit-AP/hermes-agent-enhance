@@ -2890,9 +2890,21 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
 
     model = ""
     if detected_ids:
-        print(f"✓ Discovered {len(detected_ids)} model(s) via {wire} protocol wire:")
+        specs_by_id = {s.get("id"): s for s in (inspection.get("models") or []) if isinstance(s, dict)}
+
+        def _fmt_ctx(spec: dict) -> str:
+            ctx = spec.get("context_length")
+            if isinstance(ctx, int) and ctx > 0:
+                if ctx >= 1000000:
+                    return f"{ctx / 1000000:g}M ctx"
+                if ctx >= 1000:
+                    return f"{ctx // 1000}k ctx"
+                return f"{ctx} ctx"
+            return "ctx n/a"
+
+        print(f"Discovered {len(detected_ids)} model(s) via {wire} protocol wire:")
         for idx, m_id in enumerate(detected_ids[:10], 1):
-            print(f"   {idx}. {m_id}")
+            print(f"   {idx}. {m_id} ({_fmt_ctx(specs_by_id.get(m_id, {}))})")
         if len(detected_ids) > 10:
             print(f"   ... and {len(detected_ids) - 10} more")
         print()

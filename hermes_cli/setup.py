@@ -1720,7 +1720,11 @@ def setup_agent_settings(config: dict):
         "4. Strict Sandbox Mode",
         "Keep current settings"
     ]
-    p_idx = prompt_choice("Pilih Execution Profile:", profile_choices, 0)
+    # Default to "Keep current settings" — Full Access disables approvals and
+    # must never be selected by an accidental Enter press.
+    p_idx = prompt_choice("Pilih Execution Profile:", profile_choices, 4)
+    if p_idx == 4:
+        print_info("Execution profile unchanged.")
     
     if p_idx == 0:  # Full Access
         config.setdefault("approvals", {})["mode"] = "off"
@@ -3343,7 +3347,9 @@ def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
         "3. Standard Balanced Mode",
         "4. Strict Sandbox Mode",
     ]
-    p_idx = prompt_choice("Pilih Execution Profile:", profile_choices, 0)
+    # Default to Standard Balanced — Full Access disables approvals and must
+    # be an explicit user choice, never an accidental Enter press.
+    p_idx = prompt_choice("Pilih Execution Profile:", profile_choices, 2)
     
     if p_idx == 0:
         config.setdefault("approvals", {})["mode"] = "off"

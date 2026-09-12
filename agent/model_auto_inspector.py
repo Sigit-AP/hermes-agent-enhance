@@ -205,7 +205,27 @@ def _derive_model_spec(model_id: str, raw_meta: Dict[str, Any]) -> Dict[str, Any
         else:
             max_output = 4096
 
-    supports_vision = any(k in m_lower for k in ["vision", "vl", "4o", "gemini", "claude", "pixtral", "qvq"])
+    # Vision capability: prefer explicit provider metadata, heuristic only as fallback.
+    supports_vision: Optional[bool] = None
+    for field in ("supports_vision", "vision", "modalities", "supported_modalities", "input_modalities"):
+        if field in raw_meta:
+            val = raw_meta[field]
+            if isinstance(val, bool):
+                supports_vision = val
+                break
+            if isinstance(val, (list, tuple, set)):
+                lowered = {str(v).lower() for v in val}
+                if lowered & {"image", "images", "vision", "video"}:
+                    supports_vision = True
+                    break
+                if lowered:
+                    supports_vision = False
+                    break
+            if isinstance(val, str) and val:
+                supports_vision = val.lower() in {"true", "yes", "1", "image", "vision"}
+                break
+    if supports_vision is None:
+        supports_vision = any(k in m_lower for k in ["vision", "vl", "4o", "gemini", "claude", "pixtral", "qvq"])
 
     return {
         "id": model_id,

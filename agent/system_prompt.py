@@ -24,8 +24,11 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
@@ -98,12 +101,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Dynamic Cognitive Soul Substrate JIT Injection
+    # Dynamic Cognitive Soul Substrate JIT Injection (best-effort).
+    # NOTE: the system prompt is built once per session without access to the
+    # live user turn, so retrieval here is keyed on durable session context
+    # (caller system_message + model/session identity) — not on per-turn text.
     try:
-        from agent.tier3_cognitive_core import tier3_memory_substrate
-        jit_memories = tier3_memory_substrate.query_relevant_soul_memory(
-            task_context=getattr(agent, "model", "") + " " + getattr(agent, "session_id", ""),
-            limit=4
+        from agent.tier3_cognitive_core import get_tier3_memory_substrate
+        _substrate_ctx = " ".join(
+            part for part in (
+                system_message or "",
+                getattr(agent, "model", "") or "",
+                getattr(agent, "session_id", "") or "",
+            )
+            if part
+        )
+        jit_memories = get_tier3_memory_substrate().query_relevant_soul_memory(
+            task_context=_substrate_ctx,
+            limit=4,
         )
         if jit_memories:
             stable_parts.append("## Dynamic Master Alignment & Knowledge Substrate\n" + "\n".join(f"- {m}" for m in jit_memories))

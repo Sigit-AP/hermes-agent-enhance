@@ -23,6 +23,8 @@ from agent.tier3_cognitive_core import (
     DynamicSoulMemorySubstrate,
     PoUInteractionMetrics,
     evaluate_execution_safety,
+    get_tier3_ledger,
+    get_tier3_memory_substrate,
 )
 
 
@@ -47,15 +49,32 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
             "rm -rf --no-preserve-root /",
             "shutdown now",
             "poweroff",
+            "reboot",
             "init 0",
+            "init 6",
+            "systemctl reboot",
+            "kill -1",
             "dd if=/dev/zero of=/dev/sda",
+            "dd of=/dev/sda1 if=/dev/zero",
             "mkfs.ext4 /dev/sda",
+            "mkfs.ext4 /dev/sda1",
             ":(){ :|:& };:",
         ]
         for cmd in fatal_commands:
             is_safe, reason = evaluate_execution_safety(cmd)
             self.assertFalse(is_safe, f"Fatal command was not blocked: {cmd}")
             self.assertIn("Tier-3 Safety Invariant", reason)
+
+    def test_no_false_positives_on_prose_and_suffix_commands(self):
+        # Upstream-anchored matching must not fire on prose or suffixed paths.
+        benign = [
+            "echo reboot",
+            "grep 'shutdown' logs",
+            "rm -rf /tmp/myapp",
+        ]
+        for cmd in benign:
+            is_safe, _ = evaluate_execution_safety(cmd)
+            self.assertTrue(is_safe, f"False positive block: {cmd}")
 
     def test_benign_dev_and_automation_commands_pass(self):
         benign_commands = [
@@ -120,6 +139,62 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         )
         self.assertIn("cumulative_energy", res1)
         self.assertEqual(res1["current_level"], 1)
+
+    def test_energy_scale_reaches_level_two(self):
+        # Regression: with unscaled energy (~4.5/turn), T(2) ≈ 22000 was
+        # unreachable (~5000 perfect turns). Scaled energy must progress.
+        metrics = PoUInteractionMetrics(
+            task_complexity=1.0,
+            master_comprehension=1.0,
+            soul_assimilation=1.0,
+            execution_precision=1.0,
+            master_satisfaction=1.0,
+        )
+        delta = self.ledger.calculate_energy_delta(metrics, current_level=1)
+        self.assertGreater(delta, 100.0)
+        level = 1
+        energy = 0.0
+        for _ in range(60):
+            energy += delta
+            if energy >= CognitivePoULedger.difficulty_target(level + 1):
+                level += 1
+                break
+        self.assertGreaterEqual(level, 2)
+
+    def test_hci_uses_rolling_history(self):
+        # One perfect turn after a bad history must NOT satisfy HCI >= 0.98.
+        bad = PoUInteractionMetrics(
+            task_complexity=0.5,
+            master_comprehension=0.2,
+            soul_assimilation=0.2,
+            execution_precision=0.5,
+            master_satisfaction=-0.5,
+        )
+        for _ in range(5):
+            self.ledger.record_turn(session_key="s-hci", metrics=bad)
+        good = PoUInteractionMetrics(
+            task_complexity=1.0,
+            master_comprehension=1.0,
+            soul_assimilation=1.0,
+            execution_precision=1.0,
+            master_satisfaction=1.0,
+        )
+        res = self.ledger.record_turn(session_key="s-hci", metrics=good)
+        self.assertLess(res["hci"], 0.98)
+
+    def test_lazy_accessors_share_instances(self):
+        self.assertIs(
+            get_tier3_ledger(db_path=self.db_path),
+            get_tier3_ledger(db_path=self.db_path),
+        )
+        self.assertIs(
+            get_tier3_memory_substrate(db_path=self.db_path),
+            get_tier3_memory_substrate(db_path=self.db_path),
+        )
+
+    def test_distill_rejects_empty_content(self):
+        self.assertIsNone(self.substrate.distill_and_store("topic", "   "))
+        self.assertIsNone(self.substrate.distill_and_store("   ", "content"))
 
     # -------------------------------------------------------------------------
     # Test Suite 3: Dynamic Semantic Soul Memory Distillation

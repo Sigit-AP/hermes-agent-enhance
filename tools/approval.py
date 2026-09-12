@@ -937,18 +937,16 @@ def check_dangerous_command(command: str, env_type: str,
     Returns:
         {"approved": True/False, "message": str or None, ...}
     """
-    # Tier-3 Invariant Safety Guard: Check before all checks
+    # Tier-3 host-survival invariant: delegates to the upstream unconditional
+    # blocklist (evaluate_execution_safety wraps detect_hardline_command) so
+    # coverage can never drift. Uses the standard hardline result shape so
+    # downstream consumers see the same "hardline" flag as upstream blocks.
     try:
         from agent.tier3_cognitive_core import evaluate_execution_safety
         is_safe, reason = evaluate_execution_safety(command)
         if not is_safe:
-            logger.warning("Tier-3 Micro-Kernel Safety Invariant Block: %s", reason)
-            return {
-                "approved": False,
-                "message": f"BLOCKED by Tier-3 VPS Survival Invariant: {reason}",
-                "pattern_key": "tier3_fatal_invariant",
-                "description": reason or "Host survival protection",
-            }
+            logger.warning("Tier-3 host-survival invariant block: %s", reason)
+            return _hardline_block_result(reason or "host survival protection")
     except Exception as e:
         logger.debug("Tier-3 safety evaluation fallback: %s", e)
 
