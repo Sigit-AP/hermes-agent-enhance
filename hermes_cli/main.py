@@ -2848,8 +2848,9 @@ def _aux_flow_provider_model(
 
 
 def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
-    """Prompt for a direct OpenAI-compatible base_url + optional api_key/model."""
+    """Prompt for a direct OpenAI-compatible base_url + auto-inspect models & spec."""
     from hermes_cli.secret_prompt import masked_secret_prompt
+    from agent.model_auto_inspector import auto_inspect_models, _derive_model_spec
 
     display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
     current_base_url = str(task_cfg.get("base_url") or "").strip()
@@ -2857,7 +2858,7 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
 
     print()
     print(f"  Custom endpoint for {display_name}")
-    print("  Provide an OpenAI-compatible base URL (e.g. http://localhost:11434/v1)")
+    print("  Provide an OpenAI-compatible or Anthropic-compatible base URL (e.g. http://localhost:11434/v1)")
     print()
     try:
         url_prompt = (
@@ -2871,24 +2872,50 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
     if not url:
         print("No URL provided. No change.")
         return
-    try:
-        model_prompt = (
-            f"Model slug (optional) [{current_model}]: "
-            if current_model
-            else "Model slug (optional): "
-        )
-        model = input(model_prompt).strip()
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return
-    model = model or current_model
+
     try:
         api_key = masked_secret_prompt(
-            "API key (optional, blank = use OPENAI_API_KEY): "
+            "API key (optional, press Enter if no key required): "
         ).strip()
     except (KeyboardInterrupt, EOFError):
         print()
         return
+
+    # Auto-inspect models via dual-wire (OpenAI & Anthropic APIs)
+    print("🔍 Auto-inspecting endpoint models & specifications...")
+    inspection = auto_inspect_models(url, api_key=api_key, timeout=5.0)
+    detected_ids = inspection.get("detected_ids") or []
+    wire = inspection.get("wire") or "openai"
+
+    model = ""
+    if detected_ids:
+        print(f"✓ Discovered {len(detected_ids)} model(s) via {wire} protocol wire:")
+        for idx, m_id in enumerate(detected_ids[:10], 1):
+            print(f"   {idx}. {m_id}")
+        if len(detected_ids) > 10:
+            print(f"   ... and {len(detected_ids) - 10} more")
+        print()
+        try:
+            model_prompt = (
+                f"Model slug (or pick from list above) [{current_model or detected_ids[0]}]: "
+            )
+            val = input(model_prompt).strip()
+            model = val or current_model or detected_ids[0]
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+    else:
+        print("⚠️ Endpoint /models auto-discovery yielded no models or requires manual input.")
+        try:
+            model_prompt = (
+                f"Model slug (optional) [{current_model}]: "
+                if current_model
+                else "Model slug (optional): "
+            )
+            model = input(model_prompt).strip() or current_model
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
 
     _save_aux_choice(
         task,
