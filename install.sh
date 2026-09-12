@@ -4,9 +4,10 @@
 # =============================================================================
 set -e
 
-# Non-interactive mode for apt / dpkg (Suppress pending kernel & restart dialogs)
+# Non-interactive mode for apt / dpkg (Suppress all dialogs & automatic defaults)
 export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
+export NEEDRESTART_MODE=l
+export UCF_FORCE_CONFFOLD=1
 
 INSTALL_DIR="$HOME/.hermes-agent"
 CONFIG_DIR="$HOME/.hermes"
@@ -18,13 +19,20 @@ SYS_BIN="/usr/local/bin/hermes"
 # -----------------------------------------------------------------------------
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
-        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "$@"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l "$@"
     elif command -v sudo >/dev/null 2>&1; then
-        sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "$@"
+        sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l "$@"
     else
         "$@" || true
     fi
 }
+
+# Silence needrestart completely if present on Ubuntu/Debian systems
+if [ -f /etc/needrestart/needrestart.conf ]; then
+    run_privileged sed -i "s/#\$nrconf{restart} = 'i';/\$nrconf{restart} = 'l';/g" /etc/needrestart/needrestart.conf 2>/dev/null || true
+    run_privileged sed -i "s/\$nrconf{restart} = 'i';/\$nrconf{restart} = 'l';/g" /etc/needrestart/needrestart.conf 2>/dev/null || true
+    run_privileged sed -i "s/#\$nrconf{kernelhints} = -1;/\$nrconf{kernelhints} = 0;/g" /etc/needrestart/needrestart.conf 2>/dev/null || true
+fi
 
 # -----------------------------------------------------------------------------
 # Clean / Purge Functionality
