@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Hermes Agent Enhance — Installer
+# Hermes Agent Enhance — Tier-3 Resilient Multi-Python Installer
 # =============================================================================
 set -e
 
@@ -16,24 +16,57 @@ run_privileged() {
 
 echo "Installing Hermes Agent..."
 
-# 1. Update and install dependencies
+# 1. Update and ensure Python 3.11+ is installed
 if command -v apt-get >/dev/null 2>&1; then
     run_privileged apt-get update -y
-    run_privileged apt-get install -y python3 python3-pip python3-venv python3-dev build-essential git curl sqlite3 libffi-dev libssl-dev ripgrep nodejs npm || true
+    run_privileged apt-get install -y software-properties-common git curl sqlite3 libffi-dev libssl-dev ripgrep nodejs npm build-essential || true
+    
+    # Check if existing python3 is < 3.11 (e.g. Ubuntu 22.04 LTS which ships with 3.10)
+    NEED_PYTHON_PPA=false
+    if ! command -v python3.11 >/dev/null 2>&1 && ! command -v python3.12 >/dev/null 2>&1; then
+        PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
+        if [ "$(echo "$PY_VER < 3.11" | awk -F. '{if ($1 < 3 || ($1 == 3 && $2 < 11)) print 1; else print 0}')" -eq 1 ]; then
+            NEED_PYTHON_PPA=true
+        fi
+    fi
+
+    if [ "$NEED_PYTHON_PPA" = true ]; then
+        echo "Detected Python < 3.11. Adding deadsnakes PPA to install Python 3.11..."
+        run_privileged add-apt-repository -y ppa:deadsnakes/ppa || true
+        run_privileged apt-get update -y || true
+        run_privileged apt-get install -y python3.11 python3.11-venv python3.11-dev python3.11-distutils || true
+    fi
+
 elif command -v dnf >/dev/null 2>&1; then
-    run_privileged dnf install -y python3 python3-pip python3-devel gcc git curl sqlite sqlite-devel ripgrep nodejs npm || true
+    run_privileged dnf install -y python3.11 python3.11-devel python3.11-pip gcc git curl sqlite sqlite-devel ripgrep nodejs npm || run_privileged dnf install -y python3 python3-devel python3-pip gcc git curl sqlite sqlite-devel ripgrep nodejs npm || true
 elif command -v yum >/dev/null 2>&1; then
-    run_privileged yum install -y python3 python3-pip python3-devel gcc git curl sqlite sqlite-devel ripgrep nodejs npm || true
+    run_privileged yum install -y python3.11 python3.11-devel gcc git curl sqlite sqlite-devel ripgrep nodejs npm || run_privileged yum install -y python3 python3-devel python3-pip gcc git curl sqlite sqlite-devel ripgrep nodejs npm || true
 elif command -v apk >/dev/null 2>&1; then
     run_privileged apk add python3 py3-pip python3-dev gcc musl-dev git curl sqlite sqlite-dev ripgrep nodejs npm bash || true
 elif command -v pacman >/dev/null 2>&1; then
     run_privileged pacman -Sy --noconfirm python python-pip base-devel git curl sqlite ripgrep nodejs npm || true
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 is required but not found."
+# Detect best available Python 3.11+ binary
+PY_BIN=""
+for candidate in python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        IS_VALID=$("$candidate" -c 'import sys; print(1 if sys.version_info >= (3, 11) else 0)' 2>/dev/null || echo "0")
+        if [ "$IS_VALID" -eq 1 ]; then
+            PY_BIN="$candidate"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PY_BIN" ]; then
+    echo "Error: Python 3.11 or higher is required to run Hermes Agent."
+    echo "Current system python3 version: $(python3 --version 2>&1 || echo 'none')"
+    echo "Please install Python 3.11 manually (e.g. apt install python3.11 python3.11-venv)."
     exit 1
 fi
+
+echo "Using Python binary: $($PY_BIN --version) ($PY_BIN)"
 
 # 2. Setup installation directory
 INSTALL_DIR="$HOME/.hermes-agent"
@@ -47,10 +80,19 @@ else
     cd "$INSTALL_DIR"
 fi
 
-# 3. Virtual Environment
-if [ ! -d "$INSTALL_DIR/venv" ]; then
-    python3 -m venv "$INSTALL_DIR/venv"
+# 3. Virtual Environment with selected Python 3.11+
+if [ -d "$INSTALL_DIR/venv" ]; then
+    # Verify if existing venv uses >= 3.11
+    VENV_VALID=$("$INSTALL_DIR/venv/bin/python" -c 'import sys; print(1 if sys.version_info >= (3, 11) else 0)' 2>/dev/null || echo "0")
+    if [ "$VENV_VALID" -ne 1 ]; then
+        echo "Recreating venv with $PY_BIN..."
+        rm -rf "$INSTALL_DIR/venv"
+        "$PY_BIN" -m venv "$INSTALL_DIR/venv"
+    fi
+else
+    "$PY_BIN" -m venv "$INSTALL_DIR/venv"
 fi
+
 source "$INSTALL_DIR/venv/bin/activate"
 
 # 4. Package installation
