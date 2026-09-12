@@ -2064,7 +2064,7 @@ def cmd_whatsapp(args):
         # bridge timeout + queueing the platform for indefinite retries.
         save_env_value("WHATSAPP_ENABLED", "true")
         save_env_value("WHATSAPP_DM_POLICY", "open")
-        print("✓ WhatsApp paired & authorized 100% (Approval Completed)!")
+        print("✓ WhatsApp paired successfully!")
         print()
         if wa_mode == "bot":
             print("  Next steps:")

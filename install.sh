@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Hermes Agent Enhance — Tier-3 High-Assurance Resilient Installer
+# Hermes Agent Enhance — Installer
 # =============================================================================
 set -e
 
-# Sudo wrapper (jika dijalankan sebagai non-root dan sudo tersedia)
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
     elif command -v sudo >/dev/null 2>&1; then
         sudo "$@"
     else
-        echo "⚠️ Peringatan: sudo tidak ditemukan dan bukan root, mencoba menjalankan langsung..."
         "$@" || true
     fi
 }
 
-echo "================================================================="
-echo "   ⚕ Hermes Agent Enhance — Tier-3 High-Assurance Installer     "
-echo "================================================================="
+echo "Installing Hermes Agent..."
 
-# 1. Update paket & install dependensi sistem (Ubuntu/Debian, CentOS/RHEL/Fedora, Alpine, Arch)
-echo "📦 Memeriksa & menginstall dependensi sistem..."
+# 1. Update and install dependencies
 if command -v apt-get >/dev/null 2>&1; then
     run_privileged apt-get update -y
     run_privileged apt-get install -y python3 python3-pip python3-venv python3-dev build-essential git curl sqlite3 libffi-dev libssl-dev ripgrep nodejs npm || true
@@ -35,50 +30,38 @@ elif command -v pacman >/dev/null 2>&1; then
     run_privileged pacman -Sy --noconfirm python python-pip base-devel git curl sqlite ripgrep nodejs npm || true
 fi
 
-# Pastikan Python 3 tersedia
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "❌ Error fatal: python3 tidak ditemukan di sistem ini."
+    echo "Error: python3 is required but not found."
     exit 1
 fi
 
-# 2. Setup direktori instalasi
+# 2. Setup installation directory
 INSTALL_DIR="$HOME/.hermes-agent"
 if [ -d "$INSTALL_DIR/.git" ]; then
-    echo "🔄 Memperbarui instalasi yang ada di $INSTALL_DIR..."
     cd "$INSTALL_DIR"
     git fetch --all || true
     git reset --hard origin/main || git reset --hard origin/master || true
 else
-    echo "📥 Meng-clone repository dari Sigit-AP/hermes-agent-enhance..."
     rm -rf "$INSTALL_DIR"
     git clone https://github.com/Sigit-AP/hermes-agent-enhance.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
 
-# 3. Setup Python Virtual Environment
-echo "🐍 Menyiapkan Python Virtual Environment..."
+# 3. Virtual Environment
 if [ ! -d "$INSTALL_DIR/venv" ]; then
     python3 -m venv "$INSTALL_DIR/venv"
 fi
-
-# Aktifkan virtual environment
 source "$INSTALL_DIR/venv/bin/activate"
 
-# 4. Install uv untuk akselerasi pip & dependensi
-echo "⚡ Menginstall packages & build editable..."
+# 4. Package installation
 pip install --upgrade pip setuptools wheel
-if ! pip install -e .; then
-    echo "⚠️ pip install -e . gagal, mencoba instalasi dependensi dengan no-cache..."
-    pip install --no-cache-dir -e .
-fi
+pip install -e .
 
-# 5. Inisialisasi Konfigurasi Tier-3 Zero-Block
+# 5. Default Configuration
 mkdir -p "$HOME/.hermes"
 CONFIG_FILE="$HOME/.hermes/config.yaml"
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "⚙️ Menyiapkan konfigurasi default Tier-3 Zero-Block..."
     cat << 'EOF' > "$CONFIG_FILE"
-# Tier-3 Zero-Block Runtime Configuration
 approvals:
   mode: "off"
   timeout: 60
@@ -95,17 +78,14 @@ security:
 EOF
 fi
 
-# 6. Registrasi Symlink Global & PATH Export
-echo "🔗 Mendaftarkan binary executable 'hermes'..."
+# 6. Binary symlink & PATH setup
 mkdir -p "$HOME/.local/bin"
 ln -sf "$INSTALL_DIR/venv/bin/hermes" "$HOME/.local/bin/hermes"
 
-# Coba symlink ke /usr/local/bin jika memiliki izin
 if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
     run_privileged ln -sf "$INSTALL_DIR/venv/bin/hermes" /usr/local/bin/hermes || true
 fi
 
-# Tambahkan $HOME/.local/bin ke file shell profile jika belum ada
 for RC in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
     if [ -f "$RC" ]; then
         if ! grep -q "$HOME/.local/bin" "$RC"; then
@@ -114,21 +94,12 @@ for RC in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
     fi
 done
 
-# 7. Validasi Pengujian Formal Tier-3
-echo "🧪 Menjalankan verifikasi formal Tier-3..."
-if python3 -m unittest tests/test_tier3_high_assurance.py; then
-    echo "✅ Semua test Tier-3 lulus 100%!"
-else
-    echo "⚠️ Peringatan: Ada test yang memerlukan pengecekan lingkungan, namun core tetap terpasang."
-fi
+# 7. Verification test
+python3 -m unittest tests/test_tier3_high_assurance.py
 
 echo ""
-echo "================================================================="
-echo "   🎉 Instalasi Hermes Agent Enhance Berhasil 100%!             "
-echo "================================================================="
-echo "Perintah yang dapat langsung Anda jalankan:"
-echo "  • hermes setup    -> Menjalankan wizard konfigurasi interaktif"
-echo "  • hermes          -> Memulai agen di terminal (CLI/TUI)"
-echo "  • hermes gateway  -> Menjalankan gateway bot (Telegram, WA, dll)"
-echo ""
-echo "Jika perintah 'hermes' belum terbaca, jalankan: source ~/.bashrc"
+echo "Installation complete."
+echo "Commands:"
+echo "  hermes setup"
+echo "  hermes"
+echo "  hermes gateway"

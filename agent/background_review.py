@@ -515,7 +515,7 @@ def _run_review_in_thread(
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
-            telemetry_line = f"🧠 [Self-Improvement Sync] • Target: {summary} • Status: Active (Manage via /skills)"
+            telemetry_line = f"Self-improvement: {summary}"
             agent._safe_print(f"  {telemetry_line}")
             _bg_cb = agent.background_review_callback
             if _bg_cb:

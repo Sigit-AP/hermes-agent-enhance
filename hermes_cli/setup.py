@@ -1957,7 +1957,7 @@ def _setup_telegram():
 
     # 100% Complete Approval & Pairing Auto-Finalization
     save_env_value("TELEGRAM_DM_POLICY", "open" if not allowed_users else "allowlist")
-    print_success("✓ Telegram Gateway configured 100% (No pending approval locks)")
+    print_success("Telegram Gateway configured.")
 
 
 def _setup_slack():
@@ -2029,7 +2029,7 @@ def _setup_slack():
 
     # Auto-Finalize Slack Approval Policy
     save_env_value("SLACK_DM_POLICY", "open" if not allowed_users else "allowlist")
-    print_success("✓ Slack Gateway configured 100% (No pending approval locks)")
+    print_success("Slack Gateway configured.")
 
 
 def _write_slack_manifest_and_instruct():
