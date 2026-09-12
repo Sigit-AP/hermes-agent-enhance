@@ -2881,9 +2881,10 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
         print()
         return
 
-    # Auto-inspect models via dual-wire (OpenAI & Anthropic APIs)
-    print("🔍 Auto-inspecting endpoint models & specifications...")
-    inspection = auto_inspect_models(url, api_key=api_key, timeout=5.0)
+    # Auto-inspect models via dual-wire (OpenAI & Anthropic APIs).
+    # 25s timeout: slow gateways (TLS handshake + large catalogs) need it.
+    print("Auto-inspecting endpoint models & specifications...")
+    inspection = auto_inspect_models(url, api_key=api_key, timeout=25.0)
     detected_ids = inspection.get("detected_ids") or []
     wire = inspection.get("wire") or "openai"
 
