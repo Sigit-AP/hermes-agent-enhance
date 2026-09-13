@@ -645,17 +645,26 @@ class DynamicSoulMemorySubstrate:
         """
         import math as _math
 
+        def _wordset(text: str) -> set:
+            words = re.findall(r"\w+", text.lower())
+            out = set(words)
+            out.update(stem_indonesian(w) for w in words)
+            return out
+
         N = max(1, len(rows))
-        blobs = [(r[0], (r[1] + " " + r[2]).lower(), r[3]) for r in rows]
+        blobs = [(r[0], _wordset(r[1] + " " + r[2]), r[3]) for r in rows]
+        # Query-side stems: match on the same stemmed space (df over the
+        # expanded set so stems get honest document frequencies, not max IDF).
+        qtokens = list({t for t in tokens} | {stem_indonesian(t) for t in tokens})
         df: Dict[str, int] = {}
-        for t in set(tokens):
-            df[t] = sum(1 for _, blob, _ in blobs if t in blob)
+        for t in set(qtokens):
+            df[t] = sum(1 for _, words, _ in blobs if t in words)
         max_id = max((r[0] for r in rows), default=1)
         scored: List[Tuple[float, int, str]] = []
         by_id = {r[0]: (r[1], r[2]) for r in rows}
-        for row_id, blob, importance in blobs:
+        for row_id, words, importance in blobs:
             token_score = sum(
-                (_math.log(N / (1 + df[t])) + 1.0) for t in tokens if t in blob
+                (_math.log(N / (1 + df.get(t, 0))) + 1.0) for t in qtokens if t in words
             )
             if token_score <= 0:
                 continue
@@ -667,8 +676,16 @@ class DynamicSoulMemorySubstrate:
         return scored
 
     def query_relevant_soul_memory(self, task_context: str, limit: int = 3) -> List[str]:
-        """Fetch JIT relevant memory: stem-expanded tokens → FTS5 → IDF rescoring."""
-        raw_tokens = [w.lower() for w in re.findall(r"\w+", task_context or "") if len(w) > 3]
+        """Fetch JIT relevant memory: stem-expanded tokens → FTS5 → IDF rescoring.
+
+        Short numeric tokens (e.g. "5", "404", "v2") are kept regardless of
+        length — numbers are high-signal identifiers, and dropping them caused
+        a measured 0.00 precision on numbered-procedure queries.
+        """
+        raw_tokens = [
+            w.lower() for w in re.findall(r"\w+", task_context or "")
+            if len(w) > 3 or w.isdigit()
+        ]
         tokens = expand_query_tokens(raw_tokens)
         if not tokens:
             return []
