@@ -8,6 +8,7 @@ Covers what cannot be measured before real deployment:
 5. Honest 500x verdict computed from measured numbers only.
 """
 
+import argparse
 import pathlib
 import random
 import sqlite3
@@ -160,6 +161,68 @@ class TestVirtualProduction(unittest.TestCase):
         print(f"\n[VIRT-4] recall precision@3 over 60 mems / 20 queries: {prec:.2f}")
         type(self)._measured_recall = prec
         self.assertGreaterEqual(prec, 0.80)
+
+
+class TestLevelWhyCli(unittest.TestCase):
+    def setUp(self):
+        import os
+        from unittest import mock
+
+        import agent.tier3_cognitive_core as core
+
+        core._cached_ledger.cache_clear()
+        core._cached_substrate.cache_clear()
+        self.tmp = tempfile.mkdtemp()
+        self._env = mock.patch.dict(os.environ, {"HERMES_HOME": self.tmp})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(core._cached_ledger.cache_clear)
+        self.addCleanup(core._cached_substrate.cache_clear)
+
+    def test_level_and_why_commands(self):
+        import io
+        from contextlib import redirect_stdout
+
+        import hermes_cli.main as main
+        from agent.tier3_cognitive_core import PoUInteractionMetrics as M
+        from agent.tier3_cognitive_core import get_tier3_ledger
+
+        get_tier3_ledger().record_turn("cli", M(0.8, 0.95, 0.9, 0.95, 0.7), cause="cli seed")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main.cmd_level(argparse.Namespace(export=None, import_file=None))
+        out = buf.getvalue()
+        self.assertIn("Mastery level", out)
+        self.assertIn("Promotion held", out)
+
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            main.cmd_why(argparse.Namespace(limit=5))
+        self.assertIn("cli seed", buf2.getvalue())
+
+    def test_level_export_import_roundtrip(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        import hermes_cli.main as main
+        from agent.tier3_cognitive_core import PoUInteractionMetrics as M
+        from agent.tier3_cognitive_core import get_tier3_ledger, get_tier3_memory_substrate
+
+        get_tier3_ledger().record_turn("cli", M(0.5, 0.9, 0.9, 0.9, 0.5), cause="x")
+        get_tier3_memory_substrate().distill_and_store("T", "C", 1.0)
+        fpath = str(pathlib.Path(self.tmp) / "exp.json")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main.cmd_level(argparse.Namespace(export=fpath, import_file=None))
+        self.assertIn("Exported", buf.getvalue())
+        payload = json.loads(pathlib.Path(fpath).read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["ledger"]), 1)
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            main.cmd_level(argparse.Namespace(export=None, import_file=fpath))
+        self.assertIn("Imported", buf2.getvalue())
 
 
 if __name__ == "__main__":

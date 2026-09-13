@@ -184,17 +184,36 @@ Hermes connects to multiple messaging channels from a single gateway process:
 Run the formal Tier-3 unit test suite:
 
 ```bash
-python3 -m unittest tests/test_tier3_high_assurance.py
+python3 -m unittest tests/test_tier3_high_assurance.py tests/test_model_auto_inspector.py tests/test_virtual_production.py
 ```
 
-Output:
-```
-......
-----------------------------------------------------------------------
-Ran 6 tests in 0.179s
+The virtual production harness (`tests/test_virtual_production.py`) measures the leveling system
+without a live VPS/LLM: 12-part wiring gate, cold-prompt token ratio, a simulated production month
+(167 mixed turns), and recall at scale (60 memories / 20 queries).
 
-OK
+---
+
+## 🧠 Leveling System (Proof-of-Understanding)
+
+Local-first mastery tracking in `~/.hermes/cognitive_state.db` — provider-independent by design.
+
+```bash
+hermes level              # level, energy, progress bar, blocking gates, posture
+hermes why -n 10          # evidence trail: every delta traces to its cause
+hermes level --export f.json --import f.json   # VPS backup / migration
+python3 scripts/pou-measure.py                 # cold-prompt + ledger report (VPS-ready)
 ```
+
+Rules, all enforced and tested:
+
+| Rule | Behavior |
+| :--- | :--- |
+| Promotion gates | Energy + HCI 0.98 + no-fatal + min 5 turns — blockers shown, never silent |
+| Anti-farming | Burst of 30+ trivial turns/hour throttles gains x0.5; penalties never discounted |
+| Inactivity decay | Stored energy halves per 30 idle days (lazy, disclosed in cause + projected read-only) |
+| WHY trail | Deterministic cause per turn; ASCII-safe for Windows consoles |
+| Soul memory | FTS5 + IDF rescoring + Indonesian stemming; SOUL.md re-seeds on change, learnings preserved |
+| Compact identity | Opt-in `HERMES_TIER3_COMPACT_IDENTITY=1`: ~60-char pointer + JIT recall vs 20k dump |
 
 ---
 
