@@ -525,14 +525,36 @@ def _run_review_in_thread(
                     pass
 
         # Production writer for the PoU ledger (best-effort, isolated DB).
-        # Derives conservative auto-metrics from real review signals only.
+        # Derives conservative auto-metrics from real review signals only,
+        # then links an episodic turn summary to the recorded ledger row.
         try:
-            from agent.tier3_cognitive_core import record_session_review_outcome
-            record_session_review_outcome(
+            from agent.tier3_cognitive_core import (
+                _turn_tool_stats,
+                record_session_review_outcome,
+            )
+            _pou_res = record_session_review_outcome(
                 getattr(agent, "session_id", "") or "default",
                 messages_snapshot,
                 actions,
             )
+            try:
+                from agent.pou_episodic import record_episode
+
+                _ok, _total = _turn_tool_stats(messages_snapshot)
+                _row_id = (_pou_res or {}).get("row_id")
+                if _row_id:
+                    record_episode(
+                        None,
+                        ledger_id=int(_row_id),
+                        session_key=getattr(agent, "session_id", "") or "default",
+                        messages=messages_snapshot,
+                        final_response="; ".join(dict.fromkeys(actions)) if actions else "",
+                        tools_ok=_ok,
+                        tools_total=_total,
+                        completed=True,
+                    )
+            except Exception as _ep_exc:
+                logger.debug("Episodic hook skipped: %s", _ep_exc)
         except Exception as _pou_exc:
             logger.debug("PoU ledger hook skipped: %s", _pou_exc)
 

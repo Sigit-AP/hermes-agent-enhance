@@ -444,6 +444,29 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         last = self.ledger.record_turn("s-cap", good, cause="after-capture")
         self.assertIn("quest done", last["cause"])
 
+    def test_posture_block_wired_into_volatile_prompt(self):
+        from unittest.mock import MagicMock, patch
+
+        from agent.system_prompt import build_system_prompt_parts
+
+        agent = MagicMock()
+        agent.load_soul_identity = False
+        agent.skip_context_files = True
+        agent._task_completion_guidance = False
+        agent.valid_tool_names = []
+        agent._kanban_worker_guidance = None
+        agent._memory_store = None
+        agent._memory_manager = None
+        agent.pass_session_id = False
+        agent.session_id = "s-wiring"
+        agent.model = "m"
+        agent.provider = "p"
+        with patch("run_agent.load_soul_md", return_value=""):
+            parts = build_system_prompt_parts(agent)
+        self.assertIn("volatile", parts)
+        # Posture block is best-effort: present when ledger readable.
+        self.assertTrue(all(v.isascii() for v in parts["volatile"].split("\n")))
+
     def test_lazy_accessors_share_instances(self):
         self.assertIs(
             get_tier3_ledger(db_path=self.db_path),

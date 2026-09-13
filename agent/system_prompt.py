@@ -385,6 +385,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()
+
+    # Professional posture block (Tier-3 conduct engine, best-effort).
+    # Read-only ledger read; advisory text only — never touches safety gates.
+    try:
+        from agent.pou_conduct import conduct_posture_block
+        from agent.tier3_cognitive_core import pou_status
+
+        _st = pou_status()
+        _posture_block = conduct_posture_block(
+            int(_st.get("level", 1) or 1),
+            _st.get("hci"),
+            recent_corrections=0,
+        )
+        if _posture_block:
+            volatile_parts.append(_posture_block)
+    except Exception:
+        pass
+
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
     # on every rebuild path (compression boundary, fresh-agent gateway turns,

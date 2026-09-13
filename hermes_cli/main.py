@@ -2159,6 +2159,29 @@ def cmd_why(args):
         print(line)
 
 
+def cmd_calibrate(args):
+    """Show ledger analytics and tuning recommendations (read-only)."""
+    import os
+    from pathlib import Path as _Path
+
+    from agent.pou_calibration import calibration_report
+
+    home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
+    db = home / "cognitive_state.db"
+    rep = calibration_report(db if db.exists() else None)
+    print(f"Turns recorded : {rep.get('turns', 0)}")
+    print(f"Level histogram: {rep.get('level_histogram', {})}")
+    print(f"Mean dE        : {rep.get('mean_delta', 0.0):.2f} (std {rep.get('std_delta', 0.0):.2f})")
+    print(f"Mean HCI       : {rep.get('mean_hci', 0.0):.3f}")
+    print(f"Promotions     : {rep.get('promotions', 0)}  Demotions: {rep.get('demotions', 0)}")
+    print(f"Farming hits   : {rep.get('farming_hits', 0)}  Decay hits: {rep.get('decay_hits', 0)} "
+          f"Quest hits: {rep.get('quest_hits', 0)}")
+    print(f"Days span      : {rep.get('days_span', 0.0):.1f}")
+    print("Recommendations:")
+    for rec in rep.get("recommendations", []):
+        print(f"  - {rec}")
+
+
 def cmd_quests(args):
     """Show active quests and recent completions (read-only)."""
     from agent.tier3_cognitive_core import list_quests
@@ -12757,6 +12780,17 @@ Examples:
         help="Number of recent entries to show (1-50, default: 10)",
     )
     why_parser.set_defaults(func=cmd_why)
+
+    # =========================================================================
+    # calibrate command (Tier-3 calibration readout, read-only)
+    # =========================================================================
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Show ledger statistics and constant-tuning recommendations",
+        description="Read-only analytics over the local Proof-of-Understanding "
+        "ledger. Never changes anything; recommendations are for human review.",
+    )
+    calibrate_parser.set_defaults(func=cmd_calibrate)
 
     # =========================================================================
     # quests command (Tier-3 quest engine readout, read-only)

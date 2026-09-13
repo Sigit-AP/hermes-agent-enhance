@@ -380,6 +380,7 @@ class CognitivePoULedger:
                 energy_delta, new_energy, new_level, "tier3-verified",
                 cause, hci,
             ))
+            ledger_row_id = cur.lastrowid
             # Quest generation on schedule (same transaction, after insert so
             # the new turn counts toward the cadence).
             new_quests: List[str] = []
@@ -407,6 +408,7 @@ class CognitivePoULedger:
                     f"next target {next_target:.1f}, HCI {hci:.3f}{block_txt}"
                 )
 
+            row_id = ledger_row_id
             return {
                 "energy_delta": energy_delta,
                 "cumulative_energy": new_energy,
@@ -418,6 +420,7 @@ class CognitivePoULedger:
                 "gates": gates,
                 "turns_total": turns_total,
                 "new_quests": new_quests,
+                "row_id": row_id,
             }
 
 
@@ -1218,16 +1221,25 @@ def record_turn_event(
         if total == 0 and not completed:
             return None
         precision = (success / total) if total > 0 else 0.6
+        # Measured comprehension replaces the old neutral estimate.
+        try:
+            from agent.pou_understanding import measure_turn_understanding
+
+            measured = measure_turn_understanding(messages, completed, interrupted)
+            comprehension = float(measured.get("comprehension", 0.7))
+            satisfaction = float(measured.get("satisfaction", 0.0))
+        except Exception:
+            comprehension, satisfaction = 0.7, 0.0
         metrics = PoUInteractionMetrics(
             task_complexity=min(AUTO_TURN_MAX_COMPLEXITY, 0.03 + 0.01 * total),
-            master_comprehension=0.7,
+            master_comprehension=comprehension,
             soul_assimilation=0.5,
             execution_precision=precision,
-            master_satisfaction=0.0,
+            master_satisfaction=satisfaction,
         )
         cause = (
             f"auto-turn: {success}/{total} tools ok "
-            f"(precision {precision:.2f}), neutral judgment, "
+            f"(precision {precision:.2f}), comprehension {comprehension:.2f}, "
             f"complexity capped at {AUTO_TURN_MAX_COMPLEXITY}"
         )
         return get_tier3_ledger(db_path).record_turn(session_key or "default", metrics, cause=cause)
@@ -1236,23 +1248,26 @@ def record_turn_event(
         return None
 
 
-# Frustration phrases indicating the agent missed user intent. Used only to
-# derive conservative auto-metrics for the PoU ledger — never shown to users.
-_FRUSTRATION_PHRASES = (
-    "stop doing",
-    "too verbose",
-    "don't format",
-    "do not format",
-    "why are you explaining",
-    "just give me the answer",
-    "you always do",
-    "i hate",
-    "that's wrong",
-    "that is wrong",
-    "you misunderstood",
-    "not what i asked",
-    "useless",
-)
+# Shared frustration vocabulary (single source: pou_understanding module).
+# Kept as alias so older imports keep working.
+try:
+    from agent.pou_understanding import CORRECTION_PHRASES as _FRUSTRATION_PHRASES
+except Exception:
+    _FRUSTRATION_PHRASES = (
+        "stop doing",
+        "too verbose",
+        "don't format",
+        "do not format",
+        "why are you explaining",
+        "just give me the answer",
+        "you always do",
+        "i hate",
+        "that's wrong",
+        "that is wrong",
+        "you misunderstood",
+        "not what i asked",
+        "useless",
+    )
 
 
 def record_session_review_outcome(
