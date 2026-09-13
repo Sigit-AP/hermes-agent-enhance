@@ -94,8 +94,35 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md()
         if _soul_content:
-            stable_parts.append(_soul_content)
-            _soul_loaded = True
+            # Opt-in compact identity: when the substrate already holds the
+            # seeded soul AND the operator explicitly enables
+            # HERMES_TIER3_COMPACT_IDENTITY, swap the full dump (up to 20k
+            # chars) for a ~60-char pointer; JIT memories carry the substance.
+            # Default off — preserves upstream prompt behavior verbatim.
+            _compact_id = (os.getenv("HERMES_TIER3_COMPACT_IDENTITY", "") or "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+            if _compact_id:
+                try:
+                    from agent.tier3_cognitive_core import (
+                        compact_identity_pointer,
+                        get_tier3_memory_substrate as _get_sub,
+                    )
+                    _seeded = _get_sub().count()
+                    if _seeded > 0:
+                        stable_parts.append(compact_identity_pointer(_seeded))
+                        _soul_loaded = True
+                        _soul_content = ""
+                    else:
+                        stable_parts.append(_soul_content)
+                        _soul_loaded = True
+                except Exception as _compact_exc:
+                    logger.debug("Tier-3 compact identity fallback: %s", _compact_exc)
+                    stable_parts.append(_soul_content)
+                    _soul_loaded = True
+            else:
+                stable_parts.append(_soul_content)
+                _soul_loaded = True
 
     if not _soul_loaded:
         # Fallback to hardcoded identity

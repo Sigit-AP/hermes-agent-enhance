@@ -4604,6 +4604,22 @@ def run_conversation(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    # Tier-3 PoU event-driven recording (best-effort, isolated DB).
+    # Records measured tool-execution precision per turn with neutral
+    # judgment values, so the ledger densifies without inflating.
+    # Skipped inside background-review forks to avoid self-recording.
+    try:
+        from agent.tier3_cognitive_core import record_turn_event
+        record_turn_event(
+            getattr(agent, "session_id", "") or "default",
+            messages,
+            completed=bool(completed),
+            interrupted=bool(interrupted),
+            is_review_fork=getattr(agent, "_memory_write_origin", "") == "background_review",
+        )
+    except Exception as _pou_exc:
+        logger.debug("PoU turn-event hook skipped: %s", _pou_exc)
+
     return result
 
 

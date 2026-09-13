@@ -2094,6 +2094,31 @@ def cmd_setup(args):
     run_setup_wizard(args)
 
 
+def cmd_level(args):
+    """Show cognitive mastery level (Tier-3 PoU readout, read-only)."""
+    from agent.tier3_cognitive_core import pou_status
+
+    st = pou_status()
+    bar_len = 24
+    filled = int(bar_len * st["progress_pct"] / 100.0)
+    bar = "#" * filled + "-" * (bar_len - filled)
+    print(f"Mastery level : {st['level']}")
+    print(f"Energy        : {st['energy']:.1f} / {st['next_target']:.1f} [{bar}] {st['progress_pct']:.1f}%")
+    print(f"Turns recorded: {st['turns']}")
+    print(f"HCI (last)    : {st['hci'] if st['hci'] is not None else 'n/a'}")
+    print(f"Last cause    : {st['last_cause']}")
+    print("Run `hermes why` for the evidence trail.")
+
+
+def cmd_why(args):
+    """Explain recent level/energy changes (Tier-3 PoU evidence trail)."""
+    from agent.tier3_cognitive_core import pou_why
+
+    limit = getattr(args, "limit", 10) or 10
+    for line in pou_why(limit=limit):
+        print(line)
+
+
 def cmd_postinstall(args):
     """One-shot bootstrap for pip users: install non-Python deps + run setup."""
     from hermes_cli.config import stamp_install_method
@@ -12641,6 +12666,30 @@ Examples:
         help="Overwrite existing files without confirmation",
     )
     import_parser.set_defaults(func=cmd_import)
+
+    # =========================================================================
+    # level + why commands (Tier-3 PoU readout, read-only)
+    # =========================================================================
+    level_parser = subparsers.add_parser(
+        "level",
+        help="Show cognitive mastery level, energy, and progress to next level",
+        description="Read-only view of the local Proof-of-Understanding ledger: "
+        "current level, accumulated energy, progress to the next difficulty "
+        "target, and the most recent recorded cause.",
+    )
+    level_parser.set_defaults(func=cmd_level)
+
+    why_parser = subparsers.add_parser(
+        "why",
+        help="Explain recent level/energy changes with their recorded causes",
+        description="Print the most recent PoU ledger entries with deterministic "
+        "causes, so every level or energy change traces to its evidence.",
+    )
+    why_parser.add_argument(
+        "-n", "--limit", type=int, default=10,
+        help="Number of recent entries to show (1-50, default: 10)",
+    )
+    why_parser.set_defaults(func=cmd_why)
 
     # =========================================================================
     # config command

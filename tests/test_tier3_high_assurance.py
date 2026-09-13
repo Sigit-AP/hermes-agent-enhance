@@ -182,6 +182,28 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         res = self.ledger.record_turn(session_key="s-hci", metrics=good)
         self.assertLess(res["hci"], 0.98)
 
+    def test_class_structure_intact(self):
+        # Structural guard: methods must live on the class, not orphaned at
+        # module level by a misplaced edit (regression of the pointer-insert
+        # breakage). Fails fast with a clear message instead of deep errors.
+        from agent import tier3_cognitive_core as _core
+
+        for name in (
+            "distill_and_store",
+            "query_relevant_soul_memory",
+            "ensure_soul_seeded",
+            "count",
+        ):
+            self.assertTrue(
+                callable(getattr(_core.DynamicSoulMemorySubstrate, name, None)),
+                f"DynamicSoulMemorySubstrate.{name} missing from class",
+            )
+        for name in ("record_turn", "calculate_energy_delta", "difficulty_target"):
+            self.assertTrue(
+                callable(getattr(_core.CognitivePoULedger, name, None)),
+                f"CognitivePoULedger.{name} missing from class",
+            )
+
     def test_lazy_accessors_share_instances(self):
         self.assertIs(
             get_tier3_ledger(db_path=self.db_path),
@@ -208,6 +230,47 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         # Seeded chunks are retrievable via JIT query.
         hits = self.substrate.query_relevant_soul_memory("concise assistant verify")
         self.assertTrue(any("Identity" in h or "Rules" in h for h in hits))
+
+    def test_turn_event_records_measured_precision(self):
+        import json as _json
+        from agent.tier3_cognitive_core import record_turn_event
+
+        msgs = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "on it"},
+            {"role": "tool", "content": _json.dumps({"success": True})},
+            {"role": "tool", "content": _json.dumps({"success": False})},
+        ]
+        res = record_turn_event(
+            "sess-turn", msgs, completed=True, interrupted=False, db_path=self.db_path
+        )
+        self.assertIsNotNone(res)
+        # Precision 0.5 must be reflected via lower energy than a perfect turn.
+        perfect = [
+            {"role": "user", "content": "do it"},
+            {"role": "tool", "content": _json.dumps({"success": True})},
+            {"role": "tool", "content": _json.dumps({"success": True})},
+        ]
+        res2 = record_turn_event(
+            "sess-turn", perfect, completed=True, interrupted=False, db_path=self.db_path
+        )
+        self.assertGreater(res2["energy_delta"], res["energy_delta"])
+        # Auto complexity never exceeds the cap.
+        self.assertLessEqual(res2["energy_delta"], 0.15 * 1.0 * 2.8 * 100.0 + 1.0)
+
+    def test_turn_event_skips_fork_and_interrupt(self):
+        from agent.tier3_cognitive_core import record_turn_event
+
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertIsNone(
+            record_turn_event("s", msgs, completed=True, interrupted=True, db_path=self.db_path)
+        )
+        self.assertIsNone(
+            record_turn_event(
+                "s", msgs, completed=True, interrupted=False,
+                is_review_fork=True, db_path=self.db_path,
+            )
+        )
 
     def test_review_outcome_records_turn(self):
         from agent.tier3_cognitive_core import CognitivePoULedger, record_session_review_outcome
@@ -236,6 +299,31 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
     # -------------------------------------------------------------------------
     # Test Suite 3: Dynamic Semantic Soul Memory Distillation
     # -------------------------------------------------------------------------
+    def test_idf_rescoring_fixes_common_word_miss(self):
+        # "tuan" appears in several memories; only importance+IDF should
+        # surface the truly relevant one for a paraphrased query.
+        self.substrate.distill_and_store(
+            "Gaya laporan", "laporkan hasil kerja dalam satu baris padat", 1.0
+        )
+        self.substrate.distill_and_store(
+            "Kopi tubruk", "Tuan suka kopi tubruk pahit tiap pagi", 0.3
+        )
+        self.substrate.distill_and_store(
+            "Drama Korea", "Drama favorit tuan genre thriller", 0.2
+        )
+        hits = self.substrate.query_relevant_soul_memory(
+            "gimana maunya soal hasil kerja"
+        )
+        self.assertTrue(hits, "expected at least one recalled memory")
+        self.assertIn("Gaya laporan", hits[0])
+
+    def test_compact_identity_pointer(self):
+        from agent.tier3_cognitive_core import compact_identity_pointer
+
+        ptr = compact_identity_pointer(12)
+        self.assertIn("12", ptr)
+        self.assertLess(len(ptr), 200)
+
     def test_soul_distillation_and_jit_query(self):
         # Distill knowledge
         self.substrate.distill_and_store(

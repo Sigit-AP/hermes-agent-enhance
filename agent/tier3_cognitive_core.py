@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -120,7 +121,21 @@ def _ensure_schema(db_path: Path) -> None:
     with _connect(db_path) as conn:
         conn.executescript(_SCHEMA)
         _ensure_fts(conn)
+        _migrate_ledger_why(conn)
         conn.commit()
+
+
+def _migrate_ledger_why(conn: sqlite3.Connection) -> None:
+    """Add WHY-engine columns to pre-existing ledger tables (idempotent)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pou_ledger)").fetchall()}
+    if "cause" not in cols:
+        conn.execute("ALTER TABLE pou_ledger ADD COLUMN cause TEXT DEFAULT ''")
+    if "hci" not in cols:
+        conn.execute("ALTER TABLE pou_ledger ADD COLUMN hci REAL DEFAULT NULL")
+    conn.execute(
+        "UPDATE pou_ledger SET cause = COALESCE(NULLIF(cause, ''), 'legacy (pre-why)') "
+        "WHERE cause IS NULL OR cause = ''"
+    )
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -226,9 +241,16 @@ class CognitivePoULedger:
     def record_turn(
         self,
         session_key: str,
-        metrics: PoUInteractionMetrics
+        metrics: PoUInteractionMetrics,
+        *,
+        cause: str = "",
     ) -> Dict[str, Any]:
-        """Record turn metrics, update energy, compute leveling and persist."""
+        """Record turn metrics, update energy, compute leveling and persist.
+
+        `cause` is a deterministic WHY-template string (never LLM-generated)
+        explaining what triggered this exact delta. Stored verbatim so
+        `hermes why` can trace every level change to its evidence.
+        """
         with _connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT cumulative_energy, current_level FROM pou_ledger ORDER BY id DESC LIMIT 1")
@@ -260,22 +282,90 @@ class CognitivePoULedger:
             cur.execute("""
                 INSERT INTO pou_ledger (
                     timestamp, session_key, complexity, comprehension, soul_assimilation,
-                    precision, satisfaction, energy_delta, cumulative_energy, current_level, state_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    precision, satisfaction, energy_delta, cumulative_energy, current_level,
+                    state_hash, cause, hci
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 time.time(), session_key, metrics.task_complexity, metrics.master_comprehension,
                 metrics.soul_assimilation, metrics.execution_precision, metrics.master_satisfaction,
-                energy_delta, new_energy, new_level, "tier3-verified"
+                energy_delta, new_energy, new_level, "tier3-verified",
+                (cause or "unspecified").strip()[:500], hci,
             ))
             conn.commit()
-            
+
+            if new_level != prev_level:
+                direction = "UP" if new_level > prev_level else "DOWN"
+                level_note = (
+                    f"LEVEL {direction} {prev_level}->{new_level}: "
+                    f"energy {new_energy:.1f} vs target {next_target:.1f} (next) / "
+                    f"{current_target:.1f} (current), HCI {hci:.3f}"
+                )
+            else:
+                level_note = (
+                    f"level held at {new_level}: energy {new_energy:.1f} / "
+                    f"next target {next_target:.1f}, HCI {hci:.3f}"
+                )
+
             return {
                 "energy_delta": energy_delta,
                 "cumulative_energy": new_energy,
                 "current_level": new_level,
                 "level_changed": (new_level != prev_level),
                 "hci": hci,
+                "cause": (cause or "unspecified").strip()[:500],
+                "level_note": level_note,
             }
+
+
+def pou_status(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Current PoU standing for `hermes level` readout (read-only)."""
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    if not path.exists():
+        return {"turns": 0, "level": 1, "energy": 0.0,
+                "next_target": CognitivePoULedger.difficulty_target(2),
+                "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet"}
+    _ensure_schema(path)
+    with _connect(path) as conn:
+        cur = conn.cursor()
+        turns = cur.execute("SELECT COUNT(*) FROM pou_ledger").fetchone()[0]
+        row = cur.execute(
+            "SELECT cumulative_energy, current_level, hci, cause "
+            "FROM pou_ledger ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return {"turns": 0, "level": 1, "energy": 0.0,
+                "next_target": CognitivePoULedger.difficulty_target(2),
+                "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet"}
+    energy, level, hci, cause = row
+    target = CognitivePoULedger.difficulty_target(level + 1)
+    return {"turns": turns, "level": level, "energy": energy,
+            "next_target": target,
+            "progress_pct": max(0.0, min(100.0, 100.0 * energy / target)),
+            "hci": hci, "last_cause": cause or "unspecified"}
+
+
+def pou_why(limit: int = 10, db_path: Optional[Path] = None) -> List[str]:
+    """Last-N ledger explanations for `hermes why` (read-only, deterministic)."""
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    if not path.exists():
+        return ["No PoU turns recorded yet."]
+    _ensure_schema(path)
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT timestamp, energy_delta, cumulative_energy, current_level, cause "
+            "FROM pou_ledger ORDER BY id DESC LIMIT ?",
+            (max(1, min(50, limit)),),
+        ).fetchall()
+    if not rows:
+        return ["No PoU turns recorded yet."]
+    lines = []
+    for ts, delta, energy, level, cause in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts or 0))
+        # ASCII-only: U+0394 (Δ) and em-dash crash Windows cp1252 consoles.
+        lines.append(
+            f"[{when}] L{level} dE{delta:+.1f} (E={energy:.1f}) - {cause or 'unspecified'}"
+        )
+    return lines
 
 
 # =============================================================================
@@ -324,41 +414,83 @@ class DynamicSoulMemorySubstrate:
         """, (query, limit))
         return cur.fetchall()
 
+    @staticmethod
+    def _rescore(
+        rows: List[Tuple[int, str, str, float]],
+        tokens: List[str],
+    ) -> List[Tuple[float, int, str]]:
+        """Rank candidates by IDF(token rarity) × importance × creation recency.
+
+        - IDF down-weights ubiquitous words (e.g. "tuan" in every memory) so
+          rare discriminative tokens decide — this fixed the measured MISS
+          where FTS rank picked wrong memories sharing one common word.
+        - Recency uses AUTOINCREMENT id order (higher = stored later) instead
+          of last_recalled, avoiding a rich-get-richer recall feedback loop.
+        Rows are (id, topic, semantic_content, importance).
+        """
+        import math as _math
+
+        N = max(1, len(rows))
+        blobs = [(r[0], (r[1] + " " + r[2]).lower(), r[3]) for r in rows]
+        df: Dict[str, int] = {}
+        for t in set(tokens):
+            df[t] = sum(1 for _, blob, _ in blobs if t in blob)
+        max_id = max((r[0] for r in rows), default=1)
+        scored: List[Tuple[float, int, str]] = []
+        by_id = {r[0]: (r[1], r[2]) for r in rows}
+        for row_id, blob, importance in blobs:
+            token_score = sum(
+                (_math.log(N / (1 + df[t])) + 1.0) for t in tokens if t in blob
+            )
+            if token_score <= 0:
+                continue
+            recency = 0.9 + 0.2 * (row_id / max_id)
+            final = token_score * (0.5 + importance) * recency
+            topic, text = by_id[row_id]
+            scored.append((final, row_id, f"[{topic}] {text}"))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
+
     def query_relevant_soul_memory(self, task_context: str, limit: int = 3) -> List[str]:
-        """Fetch JIT (Just-In-Time) relevant memory via FTS5 with ranked fallback."""
+        """Fetch JIT relevant memory: FTS5 candidates → IDF rescoring → fallback."""
         tokens = [w.lower() for w in re.findall(r"\w+", task_context or "") if len(w) > 3]
         if not tokens:
             return []
 
         with _connect(self.db_path) as conn:
-            # Primary path: FTS5 full-text match over quoted tokens.
+            # Primary path: FTS5 over-generates candidates, IDF rescoring picks.
             try:
                 fts_query = " OR ".join(f'"{t}"' for t in tokens[:10])
-                rows = self._fts_query(conn, fts_query, limit)
-                if rows:
-                    self._touch(conn, [r[0] for r in rows])
-                    conn.commit()
-                    return [f"[{topic}] {text}" for _, topic, text in rows]
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT m.id, m.topic, m.semantic_content, m.importance
+                    FROM cognitive_memory_fts f
+                    JOIN cognitive_memory_substrate m ON m.id = f.rowid
+                    WHERE cognitive_memory_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                """, (fts_query, max(limit * 5, 15)))
+                fts_rows = cur.fetchall()
+                if fts_rows:
+                    ranked = self._rescore(fts_rows, tokens)[:limit]
+                    if ranked:
+                        self._touch(conn, [r_id for _, r_id, _ in ranked])
+                        conn.commit()
+                        return [item[2] for item in ranked]
             except sqlite3.OperationalError as exc:
                 logger.debug("FTS query failed, using fallback: %s", exc)
 
-            # Fallback path: ranked substring scoring.
+            # Fallback path: rescore the whole corpus identically.
             cur = conn.cursor()
-            cur.execute("SELECT id, topic, semantic_content FROM cognitive_memory_substrate ORDER BY importance DESC")
+            cur.execute(
+                "SELECT id, topic, semantic_content, importance "
+                "FROM cognitive_memory_substrate ORDER BY importance DESC"
+            )
             rows = cur.fetchall()
-
-            scored = []
-            for row_id, topic, text in rows:
-                topic_l, text_l = topic.lower(), text.lower()
-                score = sum(1 for t in tokens if t in topic_l or t in text_l)
-                if score > 0:
-                    scored.append((score, row_id, f"[{topic}] {text}"))
-
-            scored.sort(key=lambda x: x[0], reverse=True)
-            selected = scored[:limit]
-            self._touch(conn, [r_id for _, r_id, _ in selected])
+            ranked = self._rescore(rows, tokens)[:limit]
+            self._touch(conn, [r_id for _, r_id, _ in ranked])
             conn.commit()
-            return [item[2] for item in selected]
+            return [item[2] for item in ranked]
 
     @staticmethod
     def _touch(conn: sqlite3.Connection, row_ids: List[int]) -> None:
@@ -424,6 +556,94 @@ class DynamicSoulMemorySubstrate:
         return stored
 
 
+def compact_identity_pointer(chunk_count: int) -> str:
+    """Tiny stable-prompt pointer replacing a re-dumped identity file.
+
+    Used only when HERMES_TIER3_COMPACT_IDENTITY=1 and the substrate already
+    holds the seeded identity: ~60 chars instead of up to 20_000 (~40-300x
+    on the identity line-item), with JIT memories carrying the substance.
+    """
+    return (
+        f"[Identity assimilated into memory substrate ({chunk_count} chunks); "
+        f"relevant partitions recalled just-in-time below.]"
+    )
+
+
+# Maximum complexity an automatically derived turn may carry. Auto turns use
+# real tool-execution signals but neutral judgment values, so the cap keeps
+# them informative without ever inflating leveling on their own.
+AUTO_TURN_MAX_COMPLEXITY = 0.15
+
+
+def _turn_tool_stats(messages: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """Count (successful, total) tool calls since the last user message.
+
+    Tool content is JSON with a "success" flag when structured, plain text
+    otherwise (counted as success — the turn cap bounds any inflation).
+    """
+    start = 0
+    for idx, msg in enumerate(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            start = idx + 1
+    success = 0
+    total = 0
+    for msg in (messages or [])[start:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        total += 1
+        content = msg.get("content", "")
+        try:
+            data = json.loads(content) if isinstance(content, str) else content
+            if isinstance(data, dict) and data.get("success") is False:
+                continue
+        except Exception:
+            pass
+        success += 1
+    return success, total
+
+
+def record_turn_event(
+    session_key: str,
+    messages: List[Dict[str, Any]],
+    *,
+    completed: bool,
+    interrupted: bool,
+    is_review_fork: bool = False,
+    db_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Record one conservative per-turn PoU event (event-driven density).
+
+    Uses only measured signals: tool success ratio from this turn's tool
+    messages. Judgment fields stay neutral (satisfaction 0.0) and complexity
+    is capped by AUTO_TURN_MAX_COMPLEXITY, so auto turns densify the ledger
+    (~10-50x more events than review-gated recording) without inflating it.
+    Skipped for interrupted turns and background-review forks.
+    """
+    try:
+        if interrupted or is_review_fork:
+            return None
+        success, total = _turn_tool_stats(messages)
+        if total == 0 and not completed:
+            return None
+        precision = (success / total) if total > 0 else 0.6
+        metrics = PoUInteractionMetrics(
+            task_complexity=min(AUTO_TURN_MAX_COMPLEXITY, 0.03 + 0.01 * total),
+            master_comprehension=0.7,
+            soul_assimilation=0.5,
+            execution_precision=precision,
+            master_satisfaction=0.0,
+        )
+        cause = (
+            f"auto-turn: {success}/{total} tools ok "
+            f"(precision {precision:.2f}), neutral judgment, "
+            f"complexity capped at {AUTO_TURN_MAX_COMPLEXITY}"
+        )
+        return get_tier3_ledger(db_path).record_turn(session_key or "default", metrics, cause=cause)
+    except Exception as exc:
+        logger.debug("PoU turn-event recording skipped: %s", exc)
+        return None
+
+
 # Frustration phrases indicating the agent missed user intent. Used only to
 # derive conservative auto-metrics for the PoU ledger — never shown to users.
 _FRUSTRATION_PHRASES = (
@@ -478,6 +698,10 @@ def record_session_review_outcome(
                 execution_precision=0.5,
                 master_satisfaction=-0.6,
             )
+            cause = (
+                f"review: {hits} frustration signal(s) in {turns} user turn(s), "
+                f"quadratic slash applied"
+            )
         elif actions:
             metrics = PoUInteractionMetrics(
                 task_complexity=min(0.4, 0.15 + 0.02 * turns),
@@ -485,6 +709,10 @@ def record_session_review_outcome(
                 soul_assimilation=0.6,
                 execution_precision=0.7,
                 master_satisfaction=0.4,
+            )
+            cause = (
+                f"review: no corrections, {len(actions)} learning action(s) saved "
+                f"over {turns} user turn(s)"
             )
         else:
             metrics = PoUInteractionMetrics(
@@ -494,7 +722,8 @@ def record_session_review_outcome(
                 execution_precision=0.6,
                 master_satisfaction=0.1,
             )
-        return get_tier3_ledger(db_path).record_turn(session_key or "default", metrics)
+            cause = "review: quiet session, no corrections, no new learnings"
+        return get_tier3_ledger(db_path).record_turn(session_key or "default", metrics, cause=cause)
     except Exception as exc:
         logger.debug("PoU review-outcome recording skipped: %s", exc)
         return None
