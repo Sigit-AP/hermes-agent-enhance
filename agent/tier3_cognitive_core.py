@@ -370,6 +370,135 @@ class DynamicSoulMemorySubstrate:
                 (now, r_id),
             )
 
+    def count(self) -> int:
+        """Number of stored substrate rows (used to seed once, never duplicate)."""
+        try:
+            with _connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM cognitive_memory_substrate")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def ensure_soul_seeded(self, soul_text: str, max_chunks: int = 15) -> int:
+        """Seed the substrate from SOUL.md once (writer side of the JIT loop).
+
+        Splits identity text by markdown headings into bounded topic chunks so
+        later turns can recall only the relevant partition instead of dumping
+        the whole file into the context window. No-op when rows already exist.
+        Returns the number of chunks stored.
+        """
+        if self.count() > 0:
+            return 0
+        text = (soul_text or "").strip()
+        if not text:
+            return 0
+        chunks: List[Tuple[str, str]] = []
+        current_topic = "SOUL Identity"
+        current_lines: List[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("##"):
+                if current_lines:
+                    chunks.append((current_topic, "\n".join(current_lines).strip()))
+                    current_lines = []
+                current_topic = stripped.lstrip("#").strip()[:200] or "SOUL Identity"
+            elif stripped.startswith("#"):
+                if current_lines:
+                    chunks.append((current_topic, "\n".join(current_lines).strip()))
+                    current_lines = []
+                current_topic = stripped.lstrip("#").strip()[:200] or "SOUL Identity"
+            else:
+                current_lines.append(line)
+        if current_lines:
+            chunks.append((current_topic, "\n".join(current_lines).strip()))
+        if not chunks:
+            chunks = [("SOUL Identity", text)]
+        stored = 0
+        for topic, body in chunks[:max_chunks]:
+            if not body:
+                continue
+            if self.distill_and_store(topic, body[:1500], importance=0.8) is not None:
+                stored += 1
+        return stored
+
+
+# Frustration phrases indicating the agent missed user intent. Used only to
+# derive conservative auto-metrics for the PoU ledger — never shown to users.
+_FRUSTRATION_PHRASES = (
+    "stop doing",
+    "too verbose",
+    "don't format",
+    "do not format",
+    "why are you explaining",
+    "just give me the answer",
+    "you always do",
+    "i hate",
+    "that's wrong",
+    "that is wrong",
+    "you misunderstood",
+    "not what i asked",
+    "useless",
+)
+
+
+def record_session_review_outcome(
+    session_key: str,
+    messages_snapshot: List[Dict[str, Any]],
+    actions: List[str],
+    db_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Record one conservative PoU turn from background-review signals.
+
+    This is the production writer for the PoU ledger: frustration phrases in
+    user messages become a low-satisfaction turn, a clean session with saved
+    learnings becomes a modest positive turn. Complexity is capped low so
+    auto-derived turns can never inflate leveling — strong turns only come
+    from explicit, verified achievements.
+    """
+    try:
+        user_texts = [
+            str(m.get("content", ""))
+            for m in (messages_snapshot or [])
+            if isinstance(m, dict) and m.get("role") == "user"
+        ]
+        turns = max(1, len(user_texts))
+        hits = sum(
+            1
+            for phrase in _FRUSTRATION_PHRASES
+            for text in user_texts
+            if phrase in text.lower()
+        )
+        if hits > 0:
+            metrics = PoUInteractionMetrics(
+                task_complexity=min(0.5, 0.2 + 0.02 * turns),
+                master_comprehension=0.4,
+                soul_assimilation=0.5,
+                execution_precision=0.5,
+                master_satisfaction=-0.6,
+            )
+        elif actions:
+            metrics = PoUInteractionMetrics(
+                task_complexity=min(0.4, 0.15 + 0.02 * turns),
+                master_comprehension=0.8,
+                soul_assimilation=0.6,
+                execution_precision=0.7,
+                master_satisfaction=0.4,
+            )
+        else:
+            metrics = PoUInteractionMetrics(
+                task_complexity=0.1,
+                master_comprehension=0.75,
+                soul_assimilation=0.5,
+                execution_precision=0.6,
+                master_satisfaction=0.1,
+            )
+        return get_tier3_ledger(db_path).record_turn(session_key or "default", metrics)
+    except Exception as exc:
+        logger.debug("PoU review-outcome recording skipped: %s", exc)
+        return None
+
 
 @lru_cache(maxsize=4)
 def _cached_ledger(db_path_str: str = "") -> CognitivePoULedger:

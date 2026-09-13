@@ -105,8 +105,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # NOTE: the system prompt is built once per session without access to the
     # live user turn, so retrieval here is keyed on durable session context
     # (caller system_message + model/session identity) — not on per-turn text.
+    # The writer side lives here too: on first sight of SOUL.md content, seed
+    # the substrate once (chunked by headings) so later turns recall only the
+    # relevant partition instead of re-dumping the whole file.
     try:
         from agent.tier3_cognitive_core import get_tier3_memory_substrate
+        _substrate = get_tier3_memory_substrate()
+        if _soul_loaded and _soul_content:
+            try:
+                _substrate.ensure_soul_seeded(_soul_content)
+            except Exception as _seed_exc:
+                logger.debug("Tier-3 soul seeding skipped: %s", _seed_exc)
         _substrate_ctx = " ".join(
             part for part in (
                 system_message or "",
@@ -115,7 +124,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
             if part
         )
-        jit_memories = get_tier3_memory_substrate().query_relevant_soul_memory(
+        jit_memories = _substrate.query_relevant_soul_memory(
             task_context=_substrate_ctx,
             limit=4,
         )

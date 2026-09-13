@@ -2850,7 +2850,7 @@ def _aux_flow_provider_model(
 def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
     """Prompt for a direct OpenAI-compatible base_url + auto-inspect models & spec."""
     from hermes_cli.secret_prompt import masked_secret_prompt
-    from agent.model_auto_inspector import auto_inspect_models, _derive_model_spec
+    from agent.model_auto_inspector import auto_inspect_models
 
     display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
     current_base_url = str(task_cfg.get("base_url") or "").strip()
@@ -4528,10 +4528,22 @@ def _model_flow_named_custom(config, provider_info):
     print()
 
     print("Fetching available models...")
-    fetch_kwargs = {"timeout": 8.0}
-    if api_mode:
-        fetch_kwargs["api_mode"] = api_mode
-    models = fetch_api_models(api_key, base_url, **fetch_kwargs)
+    # Primary: dual-wire inspector (Bearer + x-api-key auth, suffix-aware,
+    # 25s timeout). Legacy fetch kept as fallback for special endpoints.
+    models: list = []
+    try:
+        from agent.model_auto_inspector import auto_inspect_models as _inspect
+        _insp = _inspect(base_url, api_key=api_key, timeout=25.0)
+        models = list(_insp.get("detected_ids") or [])
+        if models:
+            print(f"  ({len(models)} model(s) via {_insp.get('wire', 'openai')} wire)")
+    except Exception as _insp_exc:
+        print(f"  (inspector unavailable, using legacy fetch: {_insp_exc})")
+    if not models:
+        fetch_kwargs = {"timeout": 8.0}
+        if api_mode:
+            fetch_kwargs["api_mode"] = api_mode
+        models = fetch_api_models(api_key, base_url, **fetch_kwargs) or []
 
     if models:
         default_idx = 0

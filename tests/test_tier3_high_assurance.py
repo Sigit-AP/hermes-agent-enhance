@@ -196,6 +196,43 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         self.assertIsNone(self.substrate.distill_and_store("topic", "   "))
         self.assertIsNone(self.substrate.distill_and_store("   ", "content"))
 
+    def test_soul_seeding_writes_once(self):
+        from agent.tier3_cognitive_core import record_session_review_outcome
+
+        soul = "## Identity\nYou are a concise assistant.\n\n## Rules\nAlways verify."
+        first = self.substrate.ensure_soul_seeded(soul)
+        self.assertEqual(first, 2)
+        # Second call must not duplicate rows.
+        self.assertEqual(self.substrate.ensure_soul_seeded(soul), 0)
+        self.assertEqual(self.substrate.count(), 2)
+        # Seeded chunks are retrievable via JIT query.
+        hits = self.substrate.query_relevant_soul_memory("concise assistant verify")
+        self.assertTrue(any("Identity" in h or "Rules" in h for h in hits))
+
+    def test_review_outcome_records_turn(self):
+        from agent.tier3_cognitive_core import CognitivePoULedger, record_session_review_outcome
+
+        snapshot = [
+            {"role": "user", "content": "stop doing that, this is too verbose"},
+            {"role": "assistant", "content": "noted"},
+        ]
+        res = record_session_review_outcome("sess-frust", snapshot, [], db_path=self.db_path)
+        self.assertIsNotNone(res)
+        self.assertLess(res["energy_delta"], 0.0)
+        # Ledger row persisted in the same DB.
+        import sqlite3 as _sq
+
+        with _sq.connect(str(self.db_path)) as _c:
+            n = _c.execute("SELECT COUNT(*) FROM pou_ledger").fetchone()[0]
+        self.assertEqual(n, 1)
+
+        clean_snapshot = [{"role": "user", "content": "thanks, summarize this"}]
+        res2 = record_session_review_outcome(
+            "sess-clean", clean_snapshot, ["Memory updated"], db_path=self.db_path
+        )
+        self.assertIsNotNone(res2)
+        self.assertGreater(res2["energy_delta"], 0.0)
+
     # -------------------------------------------------------------------------
     # Test Suite 3: Dynamic Semantic Soul Memory Distillation
     # -------------------------------------------------------------------------

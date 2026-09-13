@@ -524,6 +524,18 @@ def _run_review_in_thread(
                 except Exception:
                     pass
 
+        # Production writer for the PoU ledger (best-effort, isolated DB).
+        # Derives conservative auto-metrics from real review signals only.
+        try:
+            from agent.tier3_cognitive_core import record_session_review_outcome
+            record_session_review_outcome(
+                getattr(agent, "session_id", "") or "default",
+                messages_snapshot,
+                actions,
+            )
+        except Exception as _pou_exc:
+            logger.debug("PoU ledger hook skipped: %s", _pou_exc)
+
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         agent._emit_auxiliary_failure("background review", e)
