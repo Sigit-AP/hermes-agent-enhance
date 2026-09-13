@@ -115,8 +115,21 @@ CREATE TABLE IF NOT EXISTS substrate_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS quests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT,
+    title TEXT,
+    context TEXT DEFAULT '',
+    target INTEGER,
+    progress INTEGER DEFAULT 0,
+    reward REAL,
+    status TEXT DEFAULT 'active',
+    created_at REAL,
+    expires_at REAL
+);
 CREATE INDEX IF NOT EXISTS idx_pou_timestamp ON pou_ledger(timestamp);
 CREATE INDEX IF NOT EXISTS idx_pou_complexity ON pou_ledger(complexity);
+CREATE INDEX IF NOT EXISTS idx_quests_status ON quests(status);
 """
 
 
@@ -156,6 +169,13 @@ def _migrate_ledger_why(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pou_complexity ON pou_ledger(complexity)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS quests ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, title TEXT, "
+        "context TEXT DEFAULT '', target INTEGER, progress INTEGER DEFAULT 0, "
+        "reward REAL, status TEXT DEFAULT 'active', created_at REAL, expires_at REAL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quests_status ON quests(status)")
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -310,6 +330,19 @@ class CognitivePoULedger:
                         f"({trivial_recent} trivial turns/h)"
                     )
 
+            # QUEST ENGINE: fold capped completion bonuses into this turn.
+            try:
+                _expire_quests(cur, now)
+                _done, _bonus = _evaluate_quests(
+                    cur, now, metrics, _substrate_max_id(cur)
+                )
+                if _bonus > 0:
+                    energy_delta += _bonus
+                    for _t, _r in _done:
+                        cause_parts.append(f'quest done: "{_t}" +{_r:.0f}E')
+            except Exception as _q_exc:
+                logger.debug("Quest evaluation skipped: %s", _q_exc)
+
             new_energy = max(0.0, prev_energy + energy_delta)
             cause = " | ".join(cause_parts)[:500]
 
@@ -347,6 +380,16 @@ class CognitivePoULedger:
                 energy_delta, new_energy, new_level, "tier3-verified",
                 cause, hci,
             ))
+            # Quest generation on schedule (same transaction, after insert so
+            # the new turn counts toward the cadence).
+            new_quests: List[str] = []
+            try:
+                new_quests = _maybe_generate_quests(
+                    cur, now, turns_total,
+                    has_frustration_now=metrics.master_satisfaction < 0,
+                )
+            except Exception as _g_exc:
+                logger.debug("Quest generation skipped: %s", _g_exc)
             conn.commit()
 
             if new_level != prev_level:
@@ -374,6 +417,7 @@ class CognitivePoULedger:
                 "level_note": level_note,
                 "gates": gates,
                 "turns_total": turns_total,
+                "new_quests": new_quests,
             }
 
 
@@ -453,6 +497,221 @@ def pou_why(limit: int = 10, db_path: Optional[Path] = None) -> List[str]:
             )
         prev_level = level
     return list(reversed(lines))
+
+
+# =============================================================================
+# QUEST ENGINE — the leveling system gives missions to the agent (MC).
+# Quests are born ONLY from real patterns in Tuan's prompts/tasks (a
+# frustration cluster, a precision run, a learning drought) — never busywork.
+# Bonuses are capped and one-time; penalties are never discounted.
+# Every completion lands in the cause line, so `hermes why` shows it.
+# =============================================================================
+
+QUEST_REWARDS = {"streak": 100.0, "redemption": 80.0, "capture": 60.0}
+QUEST_EXPIRY_DAYS = 14.0
+QUEST_GENERATE_EVERY_TURNS = 20
+QUEST_MAX_BONUS_PER_TURN = 150.0
+
+
+def _quest_rows(cur: sqlite3.Cursor, status: str = "active") -> List[sqlite3.Row]:
+    cur.execute(
+        "SELECT id, type, title, context, target, progress, reward, status, "
+        "created_at, expires_at FROM quests WHERE status = ? ORDER BY id",
+        (status,),
+    )
+    return cur.fetchall()
+
+
+def _expire_quests(cur: sqlite3.Cursor, now: float) -> int:
+    cur.execute(
+        "UPDATE quests SET status = 'expired' WHERE status = 'active' AND expires_at <= ?",
+        (now,),
+    )
+    return cur.rowcount or 0
+
+
+def _recent_frustrations(cur: sqlite3.Cursor, since_ts: float) -> int:
+    row = cur.execute(
+        "SELECT COUNT(*) FROM pou_ledger WHERE timestamp >= ? AND satisfaction < 0",
+        (since_ts,),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _substrate_max_id(cur: sqlite3.Cursor) -> int:
+    try:
+        row = cur.execute("SELECT MAX(id) FROM cognitive_memory_substrate").fetchone()
+        return int(row[0]) if row and row[0] else 0
+    except Exception:
+        return 0
+
+
+def _maybe_generate_quests(
+    cur: sqlite3.Cursor, now: float, turns_total: int, has_frustration_now: bool
+) -> List[str]:
+    """Create at most one quest per free type slot (deterministic templates)."""
+    created: List[str] = []
+    if turns_total % QUEST_GENERATE_EVERY_TURNS != 0:
+        return created
+    active_types = set()
+    try:
+        for row in _quest_rows(cur):
+            active_types.add(row[1])
+    except Exception:
+        return created
+
+    def _add(qtype: str, title: str, context: str, target: int) -> None:
+        cur.execute(
+            "INSERT INTO quests (type, title, context, target, progress, reward, "
+            "status, created_at, expires_at) VALUES (?, ?, ?, ?, 0, ?, 'active', ?, ?)",
+            (qtype, title, context, target, QUEST_REWARDS[qtype], now,
+             now + QUEST_EXPIRY_DAYS * 86400.0),
+        )
+        created.append(title)
+
+    if "streak" not in active_types:
+        _add("streak", "Precision streak: 5 turns at precision 1.0", "", 5)
+    recent_bad = 0
+    try:
+        recent_bad = _recent_frustrations(cur, now - 7 * 86400.0)
+    except Exception:
+        recent_bad = 0
+    if "redemption" not in active_types and (recent_bad >= 2 or has_frustration_now):
+        _add("redemption", "Redemption: 3 turns with no corrections", "", 3)
+    if "capture" not in active_types:
+        try:
+            grown = _substrate_max_id(cur)
+        except Exception:
+            grown = 0
+        import json as _json
+
+        _add("capture", "Capture: distill 1 durable learning in 10 turns",
+             _json.dumps({"baseline_substrate_max_id": grown}), 1)
+    return created
+
+
+def _evaluate_quests(
+    cur: sqlite3.Cursor,
+    now: float,
+    metrics: PoUInteractionMetrics,
+    db_substrate_max_id: int,
+) -> Tuple[List[Tuple[str, float]], float]:
+    """Evaluate active quests against history + current turn.
+
+    Returns (completed [(title, reward)], total_bonus capped). Progress
+    persisted; completions marked done. Pure ledger reads + quest writes.
+    """
+    completed: List[Tuple[str, float]] = []
+    bonus = 0.0
+    try:
+        active = _quest_rows(cur)
+    except Exception:
+        return completed, bonus
+    for row in active:
+        qid, qtype, title, context, target = row[0], row[1], row[2], row[3], row[4]
+        done = False
+        progress = 0
+        try:
+            created_at = float(row[8])
+        except (TypeError, ValueError):
+            created_at = now
+        if qtype == "streak":
+            progress = _streak_progress(cur, created_at, metrics)
+            done = progress >= (target or 5)
+        elif qtype == "redemption":
+            progress = _redemption_progress(cur, created_at, metrics)
+            done = progress >= (target or 3)
+        elif qtype == "capture":
+            baseline = 0
+            try:
+                import json as _json
+
+                baseline = int(_json.loads(context or "{}").get("baseline_substrate_max_id", 0))
+            except Exception:
+                baseline = 0
+            progress = 1 if db_substrate_max_id > baseline else 0
+            done = progress >= (target or 1)
+        else:
+            continue
+        cur.execute("UPDATE quests SET progress = ? WHERE id = ?", (progress, qid))
+        if done:
+            cur.execute("UPDATE quests SET status = 'done' WHERE id = ?", (qid,))
+            reward = QUEST_REWARDS.get(qtype, 0.0)
+            completed.append((title, reward))
+            bonus += reward
+    bonus = min(bonus, QUEST_MAX_BONUS_PER_TURN)
+    return completed, bonus
+
+
+def _streak_progress(cur: sqlite3.Cursor, created_at: float, metrics: PoUInteractionMetrics) -> int:
+    vals = [metrics.execution_precision >= 1.0]
+    try:
+        rows = cur.execute(
+            "SELECT precision FROM pou_ledger WHERE timestamp >= ? ORDER BY id DESC LIMIT 30",
+            (created_at,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    for row in rows:
+        try:
+            vals.append(float(row[0]) >= 1.0)
+        except (TypeError, ValueError):
+            vals.append(False)
+    count = 0
+    for v in vals:
+        if v:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _redemption_progress(cur: sqlite3.Cursor, created_at: float, metrics: PoUInteractionMetrics) -> int:
+    vals = [metrics.master_satisfaction >= 0]
+    try:
+        rows = cur.execute(
+            "SELECT satisfaction FROM pou_ledger WHERE timestamp >= ? ORDER BY id DESC LIMIT 30",
+            (created_at,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    for row in rows:
+        try:
+            vals.append(float(row[0]) >= 0)
+        except (TypeError, ValueError):
+            vals.append(False)
+    count = 0
+    for v in vals:
+        if v:
+            count += 1
+        else:
+            break
+    return count
+
+
+def list_quests(db_path: Optional[Path] = None, include_done: int = 5) -> Dict[str, Any]:
+    """Active quests + recent history for `hermes quests` (read-only)."""
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    if not path.exists():
+        return {"active": [], "recent": []}
+    _ensure_schema(path)
+    with _connect(path) as conn:
+        cur = conn.cursor()
+        try:
+            active = [
+                {"id": r[0], "type": r[1], "title": r[2], "target": r[4],
+                 "progress": r[5], "reward": r[6]}
+                for r in _quest_rows(cur)
+            ]
+            recent_rows = cur.execute(
+                "SELECT title, status FROM quests WHERE status != 'active' "
+                "ORDER BY id DESC LIMIT ?",
+                (max(0, include_done),),
+            ).fetchall()
+            recent = [{"title": r[0], "status": r[1]} for r in recent_rows]
+        except Exception:
+            active, recent = [], []
+    return {"active": active, "recent": recent}
 
 
 def export_cognitive_state(db_path: Optional[Path] = None) -> Dict[str, Any]:

@@ -2134,6 +2134,16 @@ def cmd_level(args):
     blocked = [k for k, v in (st.get("gates") or {}).items() if not v]
     if blocked:
         print(f"Promotion held: blocked by {', '.join(blocked)}")
+    try:
+        from agent.tier3_cognitive_core import list_quests as _list_quests
+
+        _active = (_list_quests() or {}).get("active") or []
+        if _active:
+            print(f"Active quests : {len(_active)} (see `hermes quests`)")
+            for _q in _active[:3]:
+                print(f"  [{_q['type']}] {_q['title']} — {_q['progress']}/{_q['target']}")
+    except Exception:
+        pass
     print(f"HCI (last)    : {st['hci'] if st['hci'] is not None else 'n/a'}")
     print(f"Last cause    : {st['last_cause']}")
     print(f"Posture       : {posture['guidance']}")
@@ -2147,6 +2157,25 @@ def cmd_why(args):
     limit = getattr(args, "limit", 10) or 10
     for line in pou_why(limit=limit):
         print(line)
+
+
+def cmd_quests(args):
+    """Show active quests and recent completions (read-only)."""
+    from agent.tier3_cognitive_core import list_quests
+
+    data = list_quests()
+    active = data.get("active") or []
+    recent = data.get("recent") or []
+    if not active:
+        print("No active quests. New quests generate automatically every 20 recorded turns.")
+    else:
+        print("Active quests:")
+        for q in active:
+            print(f"  [{q['type']}] {q['title']} — progress {q['progress']}/{q['target']} (+{q['reward']:.0f}E)")
+    if recent:
+        print("Recently closed:")
+        for q in recent:
+            print(f"  [{q['status']}] {q['title']}")
 
 
 def cmd_postinstall(args):
@@ -12728,6 +12757,18 @@ Examples:
         help="Number of recent entries to show (1-50, default: 10)",
     )
     why_parser.set_defaults(func=cmd_why)
+
+    # =========================================================================
+    # quests command (Tier-3 quest engine readout, read-only)
+    # =========================================================================
+    quests_parser = subparsers.add_parser(
+        "quests",
+        help="Show active leveling quests and recent completions",
+        description="Missions the leveling system derives from real prompt/task "
+        "patterns. Read-only; quests are born, tracked, and completed by "
+        "recorded turns, never by hand.",
+    )
+    quests_parser.set_defaults(func=cmd_quests)
 
     # =========================================================================
     # config command

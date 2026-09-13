@@ -43,7 +43,7 @@ class TestVirtualProduction(unittest.TestCase):
         fns = ["evaluate_execution_safety", "record_turn_event", "record_session_review_outcome",
                "pou_status", "pou_why", "conduct_advice", "export_cognitive_state",
                "import_cognitive_state", "compact_identity_pointer", "stem_indonesian",
-               "expand_query_tokens"]
+               "expand_query_tokens", "list_quests", "promotion_gates"]
         for name in fns:
             self.assertTrue(callable(getattr(core, name, None)), name)
         # Wiring: hooks referenced from production call sites (not just defined).
@@ -58,6 +58,7 @@ class TestVirtualProduction(unittest.TestCase):
 
         self.assertTrue(callable(getattr(main, "cmd_level", None)))
         self.assertTrue(callable(getattr(main, "cmd_why", None)))
+        self.assertTrue(callable(getattr(main, "cmd_quests", None)))
 
     # ------------------------------------------------------------------
     # VIRT-2: cold-prompt token ratio (measured, estimated tokens).

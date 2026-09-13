@@ -347,6 +347,103 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         lines = pou_why(limit=50, db_path=self.db_path)
         self.assertTrue(any("LEVEL UP 1->2" in line for line in lines))
 
+    def test_quest_streak_generated_and_completed(self):
+        import sqlite3 as _sq
+
+        from agent.tier3_cognitive_core import (
+            QUEST_REWARDS,
+            PoUInteractionMetrics as _M,
+            list_quests,
+        )
+
+        # precision exactly 1.0 = flawless turn (all tools succeeded).
+        perfect = _M(0.8, 0.95, 0.9, 1.0, 0.9)
+        for i in range(20):
+            self.ledger.record_turn("s-q", perfect, cause=f"setup {i}")
+        quests = list_quests(db_path=self.db_path)
+        streaks = [q for q in quests["active"] if q["type"] == "streak"]
+        self.assertEqual(len(streaks), 1)
+        # 5 more flawless turns complete it (progress counts post-creation only).
+        causes = []
+        for i in range(5):
+            last = self.ledger.record_turn("s-q", perfect, cause=f"run {i}")
+            causes.append(last["cause"])
+        done_lines = [c for c in causes if "quest done" in c]
+        self.assertEqual(len(done_lines), 1)
+        self.assertIn(str(int(QUEST_REWARDS["streak"])), done_lines[0])
+        quests2 = list_quests(db_path=self.db_path)
+        self.assertFalse([q for q in quests2["active"] if q["type"] == "streak"])
+        self.assertTrue(any(q["status"] == "done" for q in quests2["recent"]))
+
+    def test_quest_no_duplicates_and_expiry(self):
+        import sqlite3 as _sq
+        import time as _t
+
+        from agent.tier3_cognitive_core import (
+            PoUInteractionMetrics as _M,
+            _expire_quests,
+            _maybe_generate_quests,
+            list_quests,
+        )
+
+        perfect = _M(0.8, 0.95, 0.9, 0.95, 0.9)
+        for i in range(40):
+            self.ledger.record_turn("s-q2", perfect, cause=f"s {i}")
+        quests = list_quests(db_path=self.db_path)
+        self.assertLessEqual(
+            len([q for q in quests["active"] if q["type"] == "streak"]), 1
+        )
+        # Expire everything by backdating, then verify status flips on record.
+        with _sq.connect(str(self.db_path)) as _c:
+            _c.execute("UPDATE quests SET expires_at = ?", (_t.time() - 1.0,))
+            _c.commit()
+        self.ledger.record_turn("s-q2", perfect, cause="after-expiry")
+        quests2 = list_quests(db_path=self.db_path)
+        self.assertFalse(quests2["active"])
+        self.assertTrue(all(q["status"] == "expired" for q in quests2["recent"]))
+
+    def test_quest_redemption_from_frustration(self):
+        import sqlite3 as _sq
+        import time as _t
+
+        from agent.tier3_cognitive_core import (
+            PoUInteractionMetrics as _M,
+            _maybe_generate_quests,
+            list_quests,
+        )
+
+        bad = _M(0.7, 0.3, 0.5, 0.6, -0.8)
+        good = _M(0.7, 0.9, 0.7, 0.9, 0.5)
+        for i in range(3):
+            self.ledger.record_turn("s-red", bad, cause=f"bad {i}")
+        with _sq.connect(str(self.db_path)) as conn:
+            cur = conn.cursor()
+            made = _maybe_generate_quests(cur, _t.time(), 20, has_frustration_now=True)
+            conn.commit()
+        self.assertTrue(any("Redemption" in t for t in made))
+        for i in range(3):
+            last = self.ledger.record_turn("s-red", good, cause=f"good {i}")
+        self.assertIn("quest done", last["cause"])
+
+    def test_quest_capture_on_substrate_growth(self):
+        import sqlite3 as _sq
+        import time as _t
+
+        from agent.tier3_cognitive_core import (
+            PoUInteractionMetrics as _M,
+            _maybe_generate_quests,
+        )
+
+        good = _M(0.7, 0.9, 0.7, 0.9, 0.5)
+        with _sq.connect(str(self.db_path)) as conn:
+            cur = conn.cursor()
+            made = _maybe_generate_quests(cur, _t.time(), 20, has_frustration_now=False)
+            conn.commit()
+        self.assertTrue(any("Capture" in t for t in made))
+        self.substrate.distill_and_store("Quest learning", "something durable", 1.0)
+        last = self.ledger.record_turn("s-cap", good, cause="after-capture")
+        self.assertIn("quest done", last["cause"])
+
     def test_lazy_accessors_share_instances(self):
         self.assertIs(
             get_tier3_ledger(db_path=self.db_path),
