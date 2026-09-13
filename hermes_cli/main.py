@@ -2096,7 +2096,29 @@ def cmd_setup(args):
 
 def cmd_level(args):
     """Show cognitive mastery level (Tier-3 PoU readout, read-only)."""
+    import json as _json
+
     from agent.tier3_cognitive_core import conduct_advice, pou_status
+
+    export_to = getattr(args, "export", None)
+    import_from = getattr(args, "import_file", None)
+    if export_to:
+        from agent.tier3_cognitive_core import export_cognitive_state
+
+        payload = export_cognitive_state()
+        with open(export_to, "w", encoding="utf-8") as fh:
+            _json.dump(payload, fh, ensure_ascii=False, indent=2)
+        print(f"Exported {len(payload['ledger'])} ledger turns, "
+              f"{len(payload['substrate'])} memories to {export_to}")
+        return
+    if import_from:
+        from agent.tier3_cognitive_core import import_cognitive_state
+
+        with open(import_from, encoding="utf-8") as fh:
+            payload = _json.load(fh)
+        counts = import_cognitive_state(payload)
+        print(f"Imported ledger={counts['ledger']} substrate={counts['substrate']} meta={counts['meta']}")
+        return
 
     st = pou_status()
     bar_len = 24
@@ -2108,6 +2130,10 @@ def cmd_level(args):
     print(f"Turns recorded: {st['turns']}")
     if st.get("idle_days", 0.0) >= 1.0:
         print(f"Idle          : {st['idle_days']:.1f}d (decay applies on next recorded turn)")
+        print(f"Effective now : {st.get('effective_energy', st['energy']):.1f} (projected, read-only)")
+    blocked = [k for k, v in (st.get("gates") or {}).items() if not v]
+    if blocked:
+        print(f"Promotion held: blocked by {', '.join(blocked)}")
     print(f"HCI (last)    : {st['hci'] if st['hci'] is not None else 'n/a'}")
     print(f"Last cause    : {st['last_cause']}")
     print(f"Posture       : {posture['guidance']}")
@@ -12680,6 +12706,14 @@ Examples:
         description="Read-only view of the local Proof-of-Understanding ledger: "
         "current level, accumulated energy, progress to the next difficulty "
         "target, and the most recent recorded cause.",
+    )
+    level_parser.add_argument(
+        "--export", metavar="FILE",
+        help="Export ledger + substrate + meta to a JSON file (VPS backup/migration)",
+    )
+    level_parser.add_argument(
+        "--import", dest="import_file", metavar="FILE",
+        help="Merge a previously exported JSON file into the local ledger",
     )
     level_parser.set_defaults(func=cmd_level)
 

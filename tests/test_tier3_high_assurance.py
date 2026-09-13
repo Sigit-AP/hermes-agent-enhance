@@ -260,6 +260,93 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         adv2 = conduct_advice(5, 0.99)
         self.assertEqual(adv2["posture"], "senior")
 
+    def test_promotion_gates_reported_and_history_required(self):
+        from agent.tier3_cognitive_core import (
+            MIN_TURNS_FOR_PROMOTION,
+            PoUInteractionMetrics as _M,
+            promotion_gates,
+        )
+
+        gates = promotion_gates(999999.0, 1.0, 1.0, False, MIN_TURNS_FOR_PROMOTION)
+        self.assertTrue(all(gates.values()))
+        short = promotion_gates(999999.0, 1.0, 1.0, False, 1)
+        self.assertFalse(short["history_ok"])
+        # Even with huge energy, a fresh ledger must NOT promote on turn 1.
+        huge = _M(1.0, 1.0, 1.0, 1.0, 1.0)
+        res = self.ledger.record_turn("s-gate", huge, cause="huge")
+        self.assertIn("gates", res)
+        self.assertFalse(res["gates"]["history_ok"])
+        self.assertFalse(res["level_changed"])
+
+    def test_soul_reseed_on_change_preserves_distilled(self):
+        v1 = "## Identity\nYou are concise.\n\n## Rules\nVerify everything."
+        self.assertEqual(self.substrate.ensure_soul_seeded(v1), 2)
+        self.substrate.distill_and_store("User fact", "Tuan suka kopi", 1.0)
+        v2 = "## Identity\nYou are concise and warm.\n\n## Rules\nVerify everything."
+        self.assertEqual(self.substrate.ensure_soul_seeded(v2), 2)
+        import sqlite3 as _sq
+
+        with _sq.connect(str(self.db_path)) as _c:
+            seeds = _c.execute(
+                "SELECT COUNT(*) FROM cognitive_memory_substrate WHERE origin = 'soul-seed'"
+            ).fetchone()[0]
+            distilled = _c.execute(
+                "SELECT COUNT(*) FROM cognitive_memory_substrate WHERE origin = 'distilled'"
+            ).fetchone()[0]
+        self.assertEqual(seeds, 2)
+        self.assertEqual(distilled, 1)
+        # Same content again -> no-op.
+        self.assertEqual(self.substrate.ensure_soul_seeded(v2), 0)
+
+    def test_export_import_roundtrip(self):
+        from agent.tier3_cognitive_core import (
+            PoUInteractionMetrics as _M,
+            export_cognitive_state,
+            import_cognitive_state,
+        )
+
+        self.ledger.record_turn("s-x", _M(0.5, 0.9, 0.9, 0.9, 0.5), cause="x")
+        self.substrate.distill_and_store("T", "C", 1.0)
+        payload = export_cognitive_state(db_path=self.db_path)
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(len(payload["ledger"]), 1)
+        # Import into a fresh DB, twice (second must dedup substrate).
+        import pathlib as _p
+        import tempfile as _t
+
+        fresh = _p.Path(_t.mkdtemp()) / "fresh.db"
+        c1 = import_cognitive_state(payload, db_path=fresh)
+        c2 = import_cognitive_state(payload, db_path=fresh)
+        self.assertEqual((c1["ledger"], c1["substrate"]), (1, 1))
+        self.assertEqual((c2["ledger"], c2["substrate"]), (1, 0))
+        with self.assertRaises(ValueError):
+            import_cognitive_state({"version": 999}, db_path=fresh)
+
+    def test_db_indexes_exist(self):
+        import sqlite3 as _sq
+
+        with _sq.connect(str(self.db_path)) as _c:
+            names = {r[0] for r in _c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        self.assertIn("idx_pou_timestamp", names)
+        self.assertIn("idx_pou_complexity", names)
+
+    def test_end_to_end_promotion_surfaces_in_why(self):
+        from agent.tier3_cognitive_core import (
+            PoUInteractionMetrics as _M,
+            pou_why,
+        )
+
+        perfect = _M(1.0, 1.0, 1.0, 1.0, 1.0)
+        promoted = False
+        for i in range(60):
+            res = self.ledger.record_turn("s-promo", perfect, cause=f"perfect {i}")
+            if res["level_changed"] and res["current_level"] == 2:
+                promoted = True
+                break
+        self.assertTrue(promoted, "55 perfect turns must promote L1->L2")
+        lines = pou_why(limit=50, db_path=self.db_path)
+        self.assertTrue(any("LEVEL UP 1->2" in line for line in lines))
+
     def test_lazy_accessors_share_instances(self):
         self.assertIs(
             get_tier3_ledger(db_path=self.db_path),

@@ -108,8 +108,15 @@ CREATE TABLE IF NOT EXISTS cognitive_memory_substrate (
     semantic_content TEXT,
     importance REAL,
     last_recalled REAL,
-    recall_count INTEGER DEFAULT 0
+    recall_count INTEGER DEFAULT 0,
+    origin TEXT DEFAULT 'distilled'
 );
+CREATE TABLE IF NOT EXISTS substrate_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pou_timestamp ON pou_ledger(timestamp);
+CREATE INDEX IF NOT EXISTS idx_pou_complexity ON pou_ledger(complexity);
 """
 
 
@@ -135,6 +142,19 @@ def _migrate_ledger_why(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE pou_ledger SET cause = COALESCE(NULLIF(cause, ''), 'legacy (pre-why)') "
         "WHERE cause IS NULL OR cause = ''"
+    )
+    # Substrate origin tracking for soul-sync versioning (idempotent).
+    sub_cols = {row[1] for row in conn.execute("PRAGMA table_info(cognitive_memory_substrate)").fetchall()}
+    if "origin" not in sub_cols:
+        conn.execute("ALTER TABLE cognitive_memory_substrate ADD COLUMN origin TEXT DEFAULT 'distilled'")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS substrate_meta (key TEXT PRIMARY KEY, value TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pou_timestamp ON pou_ledger(timestamp)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pou_complexity ON pou_ledger(complexity)"
     )
 
 
@@ -305,7 +325,11 @@ class CognitivePoULedger:
             s_safe = max(0.01, s_bar)
             hci = 3.0 / ((1.0 / u_safe) + (1.0 / a_safe) + (1.0 / s_safe))
 
-            if new_energy >= next_target and hci >= 0.98 and not metrics.fatal_dissonance:
+            turns_total = cur.execute("SELECT COUNT(*) FROM pou_ledger").fetchone()[0] + 1
+            gates = promotion_gates(
+                new_energy, next_target, hci, metrics.fatal_dissonance, turns_total
+            )
+            if all(gates.values()):
                 new_level = prev_level + 1
             elif new_energy < current_target and prev_level > 1:
                 # Demotion condition
@@ -333,9 +357,11 @@ class CognitivePoULedger:
                     f"{current_target:.1f} (current), HCI {hci:.3f}"
                 )
             else:
+                blocked = [k for k, v in gates.items() if not v] if new_energy >= next_target else []
+                block_txt = f" blocked by {','.join(blocked)}" if blocked else ""
                 level_note = (
                     f"level held at {new_level}: energy {new_energy:.1f} / "
-                    f"next target {next_target:.1f}, HCI {hci:.3f}"
+                    f"next target {next_target:.1f}, HCI {hci:.3f}{block_txt}"
                 )
 
             return {
@@ -346,6 +372,8 @@ class CognitivePoULedger:
                 "hci": hci,
                 "cause": cause,
                 "level_note": level_note,
+                "gates": gates,
+                "turns_total": turns_total,
             }
 
 
@@ -353,10 +381,11 @@ def pou_status(db_path: Optional[Path] = None) -> Dict[str, Any]:
     """Current PoU standing for `hermes level` readout (read-only)."""
     path = Path(db_path) if db_path is not None else _default_db_path()
     if not path.exists():
-        return {"turns": 0, "level": 1, "energy": 0.0,
+        return {"turns": 0, "level": 1, "energy": 0.0, "effective_energy": 0.0,
                 "next_target": CognitivePoULedger.difficulty_target(2),
                 "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet",
-                "idle_days": 0.0}
+                "idle_days": 0.0,
+                "gates": {"energy_ok": False, "hci_ok": False, "no_fatal": True, "history_ok": False}}
     _ensure_schema(path)
     with _connect(path) as conn:
         cur = conn.cursor()
@@ -366,18 +395,24 @@ def pou_status(db_path: Optional[Path] = None) -> Dict[str, Any]:
             "FROM pou_ledger ORDER BY id DESC LIMIT 1"
         ).fetchone()
     if not row:
-        return {"turns": 0, "level": 1, "energy": 0.0,
+        return {"turns": 0, "level": 1, "energy": 0.0, "effective_energy": 0.0,
                 "next_target": CognitivePoULedger.difficulty_target(2),
                 "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet",
-                "idle_days": 0.0}
+                "idle_days": 0.0,
+                "gates": {"energy_ok": False, "hci_ok": False, "no_fatal": True, "history_ok": False}}
     energy, level, hci, cause, last_ts = row
     target = CognitivePoULedger.difficulty_target(level + 1)
     idle_days = max(0.0, (time.time() - (last_ts or time.time())) / 86400.0)
+    # Read-only projection: what the next record_turn would start from after
+    # lazy decay (no mutation here — the ledger only changes on record).
+    effective = energy * (0.5 ** (idle_days / INACTIVITY_HALVING_DAYS)) if idle_days >= 1.0 else energy
+    gates = promotion_gates(energy, target, hci if hci is not None else 0.0, False, turns)
     return {"turns": turns, "level": level, "energy": energy,
+            "effective_energy": effective,
             "next_target": target,
             "progress_pct": max(0.0, min(100.0, 100.0 * energy / target)),
             "hci": hci, "last_cause": cause or "unspecified",
-            "idle_days": idle_days}
+            "idle_days": idle_days, "gates": gates}
 
 
 def pou_why(limit: int = 10, db_path: Optional[Path] = None) -> List[str]:
@@ -418,6 +453,96 @@ def pou_why(limit: int = 10, db_path: Optional[Path] = None) -> List[str]:
             )
         prev_level = level
     return list(reversed(lines))
+
+
+def export_cognitive_state(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Export ledger + substrate + meta as a portable dict (VPS backup/migration).
+
+    Read-only. Secrets are never stored in these tables, so the payload is
+    safe to move between machines.
+    """
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    if not path.exists():
+        return {"version": 1, "ledger": [], "substrate": [], "meta": {}}
+    _ensure_schema(path)
+    with _connect(path) as conn:
+        cur = conn.cursor()
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(pou_ledger)").fetchall()]
+        ledger_rows = [dict(zip(cols, r)) for r in cur.execute("SELECT * FROM pou_ledger ORDER BY id").fetchall()]
+        scols = [r[1] for r in cur.execute("PRAGMA table_info(cognitive_memory_substrate)").fetchall()]
+        sub_rows = [dict(zip(scols, r)) for r in cur.execute("SELECT * FROM cognitive_memory_substrate ORDER BY id").fetchall()]
+        meta = dict(cur.execute("SELECT key, value FROM substrate_meta").fetchall())
+    return {"version": 1, "ledger": ledger_rows, "substrate": sub_rows, "meta": meta}
+
+
+def import_cognitive_state(payload: Dict[str, Any], db_path: Optional[Path] = None) -> Dict[str, int]:
+    """Merge an exported payload into the local DB (VPS restore/migration).
+
+    Ledger rows are appended as history (new ids); substrate rows merge by
+    (topic, semantic_content) dedup so re-imports never duplicate; meta keys
+    merge with incoming values winning. Returns counts per section.
+    """
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unsupported cognitive-state payload (expected version 1)")
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    _ensure_schema(path)
+    counts = {"ledger": 0, "substrate": 0, "meta": 0}
+    with _connect(path) as conn:
+        cur = conn.cursor()
+        for row in payload.get("ledger") or []:
+            if not isinstance(row, dict):
+                continue
+            cur.execute("""
+                INSERT INTO pou_ledger (
+                    timestamp, session_key, complexity, comprehension, soul_assimilation,
+                    precision, satisfaction, energy_delta, cumulative_energy, current_level,
+                    state_hash, cause, hci
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row.get("timestamp", time.time()), str(row.get("session_key", "imported")),
+                float(row.get("complexity", 0) or 0), float(row.get("comprehension", 0) or 0),
+                float(row.get("soul_assimilation", 0) or 0), float(row.get("precision", 0) or 0),
+                float(row.get("satisfaction", 0) or 0), float(row.get("energy_delta", 0) or 0),
+                float(row.get("cumulative_energy", 0) or 0), int(row.get("current_level", 1) or 1),
+                str(row.get("state_hash", "imported")), str(row.get("cause", "imported"))[:500],
+                row.get("hci"),
+            ))
+            counts["ledger"] += 1
+        for row in payload.get("substrate") or []:
+            if not isinstance(row, dict):
+                continue
+            topic = str(row.get("topic", "")).strip()[:200]
+            content = str(row.get("semantic_content", "")).strip()
+            if not topic or not content:
+                continue
+            exists = cur.execute(
+                "SELECT 1 FROM cognitive_memory_substrate WHERE topic = ? AND semantic_content = ? LIMIT 1",
+                (topic, content),
+            ).fetchone()
+            if exists:
+                continue
+            try:
+                importance = max(0.0, min(10.0, float(row.get("importance", 1.0))))
+            except (TypeError, ValueError):
+                importance = 1.0
+            cur.execute("""
+                INSERT INTO cognitive_memory_substrate (topic, semantic_content, importance, last_recalled, recall_count, origin)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                topic, content, importance, float(row.get("last_recalled", time.time()) or time.time()),
+                int(row.get("recall_count", 0) or 0),
+                str(row.get("origin", "distilled"))[:32] or "distilled",
+            ))
+            counts["substrate"] += 1
+        for key, value in (payload.get("meta") or {}).items():
+            cur.execute(
+                "INSERT INTO substrate_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(key), str(value)),
+            )
+            counts["meta"] += 1
+        conn.commit()
+    return counts
 
 
 def conduct_advice(level: int, hci: Optional[float]) -> Dict[str, str]:
@@ -464,15 +589,20 @@ class DynamicSoulMemorySubstrate:
         self.db_path = Path(db_path) if db_path is not None else _default_db_path()
         _ensure_schema(self.db_path)
 
-    def distill_and_store(self, topic: str, content: str, importance: float = 1.0) -> Optional[int]:
+    def distill_and_store(
+        self, topic: str, content: str, importance: float = 1.0, origin: str = "distilled"
+    ) -> Optional[int]:
         """Store semantic soul chunk into persistent cognitive memory substrate.
 
         Returns the new row id, or None when the input carries no content.
+        `origin` tracks provenance: 'distilled' (learnings) vs 'soul-seed'
+        (SOUL.md partitions, replaceable on reseed).
         """
         clean_topic = (topic or "").strip()[:200]
         clean_content = (content or "").strip()
         if not clean_topic or not clean_content:
             return None
+        clean_origin = (origin or "distilled").strip()[:32] or "distilled"
         try:
             importance_val = max(0.0, min(10.0, float(importance)))
         except (TypeError, ValueError):
@@ -480,9 +610,9 @@ class DynamicSoulMemorySubstrate:
         with _connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO cognitive_memory_substrate (topic, semantic_content, importance, last_recalled)
-                VALUES (?, ?, ?, ?)
-            """, (clean_topic, clean_content, importance_val, time.time()))
+                INSERT INTO cognitive_memory_substrate (topic, semantic_content, importance, last_recalled, origin)
+                VALUES (?, ?, ?, ?, ?)
+            """, (clean_topic, clean_content, importance_val, time.time(), clean_origin))
             row_id = cur.lastrowid
             conn.commit()
             return row_id
@@ -599,19 +729,42 @@ class DynamicSoulMemorySubstrate:
         except Exception:
             return 0
 
-    def ensure_soul_seeded(self, soul_text: str, max_chunks: int = 15) -> int:
-        """Seed the substrate from SOUL.md once (writer side of the JIT loop).
+    @staticmethod
+    def soul_hash(soul_text: str) -> str:
+        import hashlib as _hl
 
-        Splits identity text by markdown headings into bounded topic chunks so
-        later turns can recall only the relevant partition instead of dumping
-        the whole file into the context window. No-op when rows already exist.
-        Returns the number of chunks stored.
+        return _hl.sha256((soul_text or "").encode("utf-8")).hexdigest()[:16]
+
+    def ensure_soul_seeded(self, soul_text: str, max_chunks: int = 15) -> int:
+        """Seed the substrate from SOUL.md, re-seeding when it changes.
+
+        Writer side of the JIT loop: splits identity text by markdown headings
+        into bounded topic chunks. Tracks a content hash in substrate_meta —
+        when SOUL.md changes, only origin='soul-seed' rows are replaced while
+        user-distilled learnings ('distilled') are never touched. Returns the
+        number of chunks stored (0 when already in sync).
         """
-        if self.count() > 0:
-            return 0
         text = (soul_text or "").strip()
         if not text:
             return 0
+        new_hash = self.soul_hash(text)
+        with _connect(self.db_path) as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT value FROM substrate_meta WHERE key = 'soul_hash'"
+            ).fetchone()
+            old_hash = row[0] if row else None
+            if old_hash == new_hash:
+                still_there = cur.execute(
+                    "SELECT COUNT(*) FROM cognitive_memory_substrate WHERE origin = 'soul-seed'"
+                ).fetchone()[0]
+                if still_there > 0:
+                    return 0
+            # Hash changed (or seeds missing): replace only soul-seed rows.
+            cur.execute(
+                "DELETE FROM cognitive_memory_substrate WHERE origin = 'soul-seed'"
+            )
+            conn.commit()
         chunks: List[Tuple[str, str]] = []
         current_topic = "SOUL Identity"
         current_lines: List[str] = []
@@ -637,8 +790,15 @@ class DynamicSoulMemorySubstrate:
         for topic, body in chunks[:max_chunks]:
             if not body:
                 continue
-            if self.distill_and_store(topic, body[:1500], importance=0.8) is not None:
+            if self.distill_and_store(topic, body[:1500], importance=0.8, origin="soul-seed") is not None:
                 stored += 1
+        with _connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO substrate_meta (key, value) VALUES ('soul_hash', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (new_hash,),
+            )
+            conn.commit()
         return stored
 
 
@@ -709,6 +869,26 @@ FARMING_GAIN_FACTOR = 0.5
 # on record, always disclosed in the cause line). Keeps levels earned, not
 # parked — without wiping history (rows are never deleted).
 INACTIVITY_HALVING_DAYS = 30.0
+
+# Promotion requires a minimum evidence history so a single lucky turn can
+# never promote on noise. Demotion has no such floor (accountability first).
+MIN_TURNS_FOR_PROMOTION = 5
+
+
+def promotion_gates(
+    energy: float, next_target: float, hci: float, fatal_dissonance: bool, turns_total: int
+) -> Dict[str, bool]:
+    """Evaluate each promotion gate independently (pure, testable).
+
+    Returned mapping tells exactly which gate holds a promotion back, so
+    `hermes level` never shows a confusing "100% but no level-up" again.
+    """
+    return {
+        "energy_ok": energy >= next_target,
+        "hci_ok": hci >= 0.98,
+        "no_fatal": not fatal_dissonance,
+        "history_ok": turns_total >= MIN_TURNS_FOR_PROMOTION,
+    }
 
 
 def _turn_tool_stats(messages: List[Dict[str, Any]]) -> Tuple[int, int]:
