@@ -4616,6 +4616,7 @@ def run_conversation(
             completed=bool(completed),
             interrupted=bool(interrupted),
             is_review_fork=getattr(agent, "_memory_write_origin", "") == "background_review",
+            final_response=final_response if isinstance(final_response, str) else None,
         )
     except Exception as _pou_exc:
         logger.debug("PoU turn-event hook skipped: %s", _pou_exc)

@@ -807,6 +807,45 @@ def import_cognitive_state(payload: Dict[str, Any], db_path: Optional[Path] = No
     return counts
 
 
+def pou_why_with_episodes(limit: int = 10, db_path: Optional[Path] = None) -> List[str]:
+    """WHY trail with linked episodic summaries (`hermes why --episodes`)."""
+    lines = pou_why(limit=limit, db_path=db_path)
+    if not lines or lines == ["No PoU turns recorded yet."]:
+        return lines
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    try:
+        from agent.pou_episodic import get_episode
+    except Exception:
+        return lines
+    out: List[str] = []
+    with _connect(path) as conn:
+        try:
+            rows = conn.execute(
+                "SELECT id FROM pou_ledger ORDER BY id DESC LIMIT ?",
+                (max(1, min(50, limit)),),
+            ).fetchall()
+            ids_desc = [r[0] for r in rows]
+        except Exception:
+            return lines
+    ids_asc = list(reversed(ids_desc))
+    # pou_why lines are newest-first with possible transition markers; walk
+    # episodes oldest-first aligned to data rows is complex, so instead append
+    # a compact episode section in chronological order.
+    eps = []
+    for lid in ids_asc:
+        try:
+            summary = get_episode(path, lid)
+        except Exception:
+            summary = None
+        if summary:
+            eps.append(f"  #turn {lid}: {summary}")
+    out.extend(lines)
+    if eps:
+        out.append("episodes:")
+        out.extend(eps)
+    return out
+
+
 def conduct_advice(level: int, hci: Optional[float]) -> Dict[str, str]:
     """Advisory autonomy posture derived from PoU standing (pure, no I/O).
 
@@ -1205,6 +1244,7 @@ def record_turn_event(
     interrupted: bool,
     is_review_fork: bool = False,
     db_path: Optional[Path] = None,
+    final_response: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Record one conservative per-turn PoU event (event-driven density).
 
@@ -1225,11 +1265,17 @@ def record_turn_event(
         try:
             from agent.pou_understanding import measure_turn_understanding
 
-            measured = measure_turn_understanding(messages, completed, interrupted)
+            measured = measure_turn_understanding(messages, completed, interrupted, final_response)
             comprehension = float(measured.get("comprehension", 0.7))
             satisfaction = float(measured.get("satisfaction", 0.0))
+            _corr = int(measured.get("corrections", 0) or 0)
+            _retry = int(measured.get("retries", 0) or 0)
+            _rep = int(measured.get("repeats", 0) or 0)
+            _qm = float(measured.get("qmatch", 1.0) or 0.0)
         except Exception:
             comprehension, satisfaction = 0.7, 0.0
+            _corr = _retry = _rep = 0
+            _qm = 1.0
         metrics = PoUInteractionMetrics(
             task_complexity=min(AUTO_TURN_MAX_COMPLEXITY, 0.03 + 0.01 * total),
             master_comprehension=comprehension,
@@ -1239,7 +1285,8 @@ def record_turn_event(
         )
         cause = (
             f"auto-turn: {success}/{total} tools ok "
-            f"(precision {precision:.2f}), comprehension {comprehension:.2f}, "
+            f"(precision {precision:.2f}), "
+            f"u={comprehension:.2f}(corr{_corr}/retry{_retry}/rep{_rep}/q{_qm:.2f}), "
             f"complexity capped at {AUTO_TURN_MAX_COMPLEXITY}"
         )
         return get_tier3_ledger(db_path).record_turn(session_key or "default", metrics, cause=cause)

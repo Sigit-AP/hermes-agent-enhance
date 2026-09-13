@@ -14,6 +14,34 @@ from typing import Any, Dict, List, Optional, Union
 _DBPath = Union[str, Path]
 
 
+def _resolve_db(db_path: _DBPath) -> Path:
+    """Resolve None to the default home DB (never a file literally named 'None')."""
+    if db_path is None:
+        import os
+
+        home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+        home.mkdir(parents=True, exist_ok=True)
+        return home / "cognitive_state.db"
+    return Path(db_path)
+
+
+def get_episode(db_path: _DBPath, ledger_id: int) -> Optional[str]:
+    """Fetch one episode summary by ledger row id (for `why --episodes`)."""
+    try:
+        lid = int(ledger_id)
+    except Exception:
+        return None
+    try:
+        with sqlite3.connect(str(_resolve_db(db_path)), timeout=30.0) as conn:
+            _ensure(conn)
+            row = conn.execute(
+                "SELECT summary FROM turn_episodes WHERE ledger_id = ?", (lid,)
+            ).fetchone()
+            return _ascii(row[0]) if row else None
+    except Exception:
+        return None
+
+
 def _ascii(text: Any) -> str:
     try:
         s = "" if text is None else str(text)
@@ -127,7 +155,7 @@ def record_episode(
             total = 0
         done = 1 if completed else 0
         sk = _ascii(session_key)
-        with sqlite3.connect(str(db_path), timeout=30.0) as conn:
+        with sqlite3.connect(str(_resolve_db(db_path)), timeout=30.0) as conn:
             _ensure(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO turn_episodes "
@@ -154,7 +182,7 @@ def episodic_recall(
     except Exception:
         n = 3
     try:
-        with sqlite3.connect(str(db_path), timeout=30.0) as conn:
+        with sqlite3.connect(str(_resolve_db(db_path)), timeout=30.0) as conn:
             _ensure(conn)
             cur = conn.cursor()
             cur.execute(

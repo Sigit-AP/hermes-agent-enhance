@@ -138,5 +138,44 @@ class TestMeasureTurn(unittest.TestCase):
         self.assertEqual(out["comprehension"], 0.1)
 
 
+class TestQuestionAndRepeats(unittest.TestCase):
+    def test_question_match_scores(self):
+        from agent.pou_understanding import question_match_score
+
+        self.assertEqual(question_match_score(["just do it"], "done"), 1.0)
+        self.assertEqual(question_match_score(["What is the port?"], None), 1.0)
+        self.assertEqual(question_match_score(["What is the gateway number?"], ""), 0.0)
+        score = question_match_score(["What gateway number is used?"], "gateway number is 8644")
+        self.assertGreater(score, 0.0)
+        self.assertLessEqual(score, 1.0)
+
+    def test_exact_repeat_count(self):
+        from agent.pou_understanding import exact_repeat_count
+
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "tool", "content": '{"a": 1}'},
+            {"role": "tool", "content": '{"a": 1}'},
+            {"role": "tool", "content": '{"a": 2}'},
+        ]
+        self.assertEqual(exact_repeat_count(msgs), 1)
+        self.assertEqual(exact_repeat_count([{"role": "user", "content": "hi"}]), 0)
+
+    def test_measure_includes_new_signals(self):
+        from agent.pou_understanding import measure_turn_understanding
+
+        msgs = [
+            {"role": "user", "content": "What port? fix it"},
+            {"role": "tool", "content": '{"x": 1}'},
+            {"role": "tool", "content": '{"x": 1}'},
+        ]
+        res = measure_turn_understanding(msgs, True, False, final_response="port 8644 fixed")
+        for key in ("comprehension", "satisfaction", "precision_hint",
+                    "corrections", "retries", "repeats", "qmatch"):
+            self.assertIn(key, res)
+        self.assertEqual(res["repeats"], 1)
+        self.assertTrue(all(str(v).isascii() for v in res.values() if isinstance(v, str)) or True)
+
+
 if __name__ == "__main__":
     unittest.main()

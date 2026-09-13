@@ -200,9 +200,20 @@ Local-first mastery tracking in `~/.hermes/cognitive_state.db` — provider-inde
 ```bash
 hermes level              # level, energy, progress bar, blocking gates, posture
 hermes why -n 10          # evidence trail: every delta traces to its cause
+hermes quests             # active missions + completion history
+hermes calibrate          # ledger analytics + tuning recommendations (read-only)
 hermes level --export f.json --import f.json   # VPS backup / migration
 python3 scripts/pou-measure.py                 # cold-prompt + ledger report (VPS-ready)
 ```
+
+Living-algorithm modules (`agent/`):
+
+| Module | Role |
+| :--- | :--- |
+| `pou_understanding` | Measured comprehension per turn (corrections, retry rate, tool precision) |
+| `pou_conduct` | Posture block + clarify-first triggers (advisory, safety untouched) |
+| `pou_calibration` | Read-only ledger analytics + constant-tuning recommendations |
+| `pou_episodic` | Turn summaries chained to ledger row ids (WHY-linked episodic memory) |
 
 Rules, all enforced and tested:
 

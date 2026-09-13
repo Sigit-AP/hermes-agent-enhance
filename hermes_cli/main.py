@@ -2152,10 +2152,14 @@ def cmd_level(args):
 
 def cmd_why(args):
     """Explain recent level/energy changes (Tier-3 PoU evidence trail)."""
-    from agent.tier3_cognitive_core import pou_why
+    from agent.tier3_cognitive_core import pou_why, pou_why_with_episodes
 
     limit = getattr(args, "limit", 10) or 10
-    for line in pou_why(limit=limit):
+    if getattr(args, "episodes", False):
+        lines = pou_why_with_episodes(limit=limit)
+    else:
+        lines = pou_why(limit=limit)
+    for line in lines:
         print(line)
 
 
@@ -2169,6 +2173,11 @@ def cmd_calibrate(args):
     home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
     db = home / "cognitive_state.db"
     rep = calibration_report(db if db.exists() else None)
+    if getattr(args, "json", False):
+        import json as _json
+
+        print(_json.dumps(rep, ensure_ascii=True, indent=2, default=str))
+        return
     print(f"Turns recorded : {rep.get('turns', 0)}")
     print(f"Level histogram: {rep.get('level_histogram', {})}")
     print(f"Mean dE        : {rep.get('mean_delta', 0.0):.2f} (std {rep.get('std_delta', 0.0):.2f})")
@@ -12779,6 +12788,10 @@ Examples:
         "-n", "--limit", type=int, default=10,
         help="Number of recent entries to show (1-50, default: 10)",
     )
+    why_parser.add_argument(
+        "--episodes", action="store_true",
+        help="Append linked episodic turn summaries under the trail",
+    )
     why_parser.set_defaults(func=cmd_why)
 
     # =========================================================================
@@ -12789,6 +12802,10 @@ Examples:
         help="Show ledger statistics and constant-tuning recommendations",
         description="Read-only analytics over the local Proof-of-Understanding "
         "ledger. Never changes anything; recommendations are for human review.",
+    )
+    calibrate_parser.add_argument(
+        "--json", action="store_true",
+        help="Machine-readable JSON output",
     )
     calibrate_parser.set_defaults(func=cmd_calibrate)
 

@@ -2,8 +2,8 @@
 
 Pure functions only: no I/O, no DB, no imports beyond stdlib.
 Replaces neutral 0.7/0.75 judgment estimates with measured signals
-derived from correction phrases, tool retry/error rate, and turn
-completion state.
+derived from correction phrases, tool retry/error rate, exact-arg
+repeats, question-vs-response match, and turn completion state.
 
 All strings ASCII-only (Windows cp1252 console safety).
 """
@@ -100,6 +100,50 @@ def tool_retry_stats(messages: List[Dict[str, Any]]) -> Tuple[int, int]:
     return errors, total
 
 
+_WH_RE = re.compile(r"\b(what|why|how|when|where|which|who|apakah|bagaimana|kenapa|kapan|dimana|berapa)\b", re.IGNORECASE)
+
+
+def question_match_score(user_texts: List[str], final_response: Optional[str] = None) -> float:
+    """How well the response covers an asked question (0..1).
+
+    Deterministic keyword overlap: question keywords (len>4 tokens from texts
+    containing '?' or wh-words) vs response text. Returns 1.0 when no question
+    was asked OR when final_response is None (unknown — never punish what was
+    not observed). An explicitly empty response to a question scores 0.0.
+    """
+    questions = [t for t in (user_texts or []) if isinstance(t, str) and ("?" in t or _WH_RE.search(t))]
+    if not questions:
+        return 1.0
+    keywords = {w.lower() for q in questions for w in re.findall(r"\w+", q) if len(w) > 4}
+    if not keywords:
+        return 1.0
+    if final_response is None:
+        return 1.0
+    if not isinstance(final_response, str) or not final_response.strip():
+        return 0.0
+    resp_words = set(re.findall(r"\w+", final_response.lower()))
+    return len(keywords & resp_words) / len(keywords)
+
+
+def exact_repeat_count(messages: List[Dict[str, Any]]) -> int:
+    """Count consecutive identical tool-call contents (retry-loop signal)."""
+    msgs = messages or []
+    start = 0
+    for idx, msg in enumerate(msgs):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            start = idx + 1
+    repeats = 0
+    prev = None
+    for msg in msgs[start:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        text = _content_text(msg.get("content", ""))
+        if prev is not None and text == prev:
+            repeats += 1
+        prev = text
+    return repeats
+
+
 def _user_texts(messages: List[Dict[str, Any]]) -> List[str]:
     texts: List[str] = []
     for msg in messages or []:
@@ -117,17 +161,24 @@ def measure_turn_understanding(
     messages: List[Dict[str, Any]],
     completed: bool,
     interrupted: bool,
+    final_response: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Measure per-turn comprehension from observable signals.
 
-    comprehension: starts 0.85, -0.15 per correction, floor 0.1.
+    comprehension: starts 0.85, -0.15 per correction, -0.05 per exact tool
+    repeat, -0.10 * (1 - question_match) when a question was asked; floor 0.1.
     satisfaction: -0.6 if any correction; else 0.2 if completed else 0.0;
         overridden to -0.3 when interrupted.
     precision_hint: 1 - errors/total over tool msgs, or None if no tools.
+    Also returns raw counts (corrections, retries, repeats, qmatch) for
+    deterministic WHY cause fragments.
     """
-    corrections = count_corrections(_user_texts(messages))
+    texts = _user_texts(messages)
+    corrections = count_corrections(texts)
     errors, total = tool_retry_stats(messages)
-    comprehension = max(0.1, 0.85 - 0.15 * corrections)
+    repeats = exact_repeat_count(messages)
+    qmatch = question_match_score(texts, final_response)
+    comprehension = max(0.1, 0.85 - 0.15 * corrections - 0.05 * repeats - 0.10 * (1.0 - qmatch))
     if corrections > 0:
         satisfaction = -0.6
     else:
@@ -141,4 +192,8 @@ def measure_turn_understanding(
         "comprehension": comprehension,
         "satisfaction": satisfaction,
         "precision_hint": precision_hint,
+        "corrections": corrections,
+        "retries": errors,
+        "repeats": repeats,
+        "qmatch": round(qmatch, 3),
     }
