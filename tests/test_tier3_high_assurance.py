@@ -204,6 +204,62 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
                 f"CognitivePoULedger.{name} missing from class",
             )
 
+    def test_farming_guard_throttles_burst_gains(self):
+        from agent.tier3_cognitive_core import (
+            FARMING_TRIVIAL_COUNT,
+            PoUInteractionMetrics as _M,
+        )
+
+        trivial = _M(0.1, 0.9, 0.9, 0.9, 0.5)
+        for _ in range(FARMING_TRIVIAL_COUNT + 2):
+            self.ledger.record_turn("s-farm", trivial, cause="burst")
+        # Next positive turn must carry the farming-guard marker and a
+        # throttled (halved) delta versus the unthrottled formula.
+        res = self.ledger.record_turn("s-farm", trivial, cause="burst")
+        self.assertIn("farming-guard", res["cause"])
+        plain = self.ledger.calculate_energy_delta(trivial, 1)
+        self.assertAlmostEqual(res["energy_delta"], plain * 0.5, places=6)
+        # Penalties are never discounted: a dissonant turn stays full force.
+        bad = _M(0.9, 0.2, 0.5, 0.8, -1.0, fatal_dissonance=True)
+        res_bad = self.ledger.record_turn("s-farm", bad, cause="bad")
+        self.assertNotIn("farming-guard", res_bad["cause"])
+        self.assertLess(res_bad["energy_delta"], -100.0)
+
+    def test_inactivity_decay_disclosed_in_cause(self):
+        import sqlite3 as _sq
+        import time as _t
+
+        from agent.tier3_cognitive_core import PoUInteractionMetrics as _M
+
+        good = _M(1.0, 1.0, 1.0, 1.0, 1.0)
+        r1 = self.ledger.record_turn("s-decay", good, cause="seed")
+        e1 = r1["cumulative_energy"]
+        self.assertGreater(e1, 0)
+        # Backdate the last row 60 idle days (halving period 30d -> x0.25).
+        with _sq.connect(str(self.db_path)) as _c:
+            _c.execute(
+                "UPDATE pou_ledger SET timestamp = ?",
+                (_t.time() - 60 * 86400.0,),
+            )
+            _c.commit()
+        r2 = self.ledger.record_turn("s-decay", good, cause="after-idle")
+        self.assertIn("inactivity decay", r2["cause"])
+        # 60 idle days at 30d halving -> stored energy quartered before delta.
+        self.assertAlmostEqual(
+            r2["cumulative_energy"], e1 * 0.25 + r2["energy_delta"], places=4
+        )
+
+    def test_why_marks_level_transitions(self):
+        from agent.tier3_cognitive_core import conduct_advice, pou_why
+
+        lines = pou_why(limit=10, db_path=self.db_path)
+        self.assertTrue(all(isinstance(line, str) for line in lines))
+        self.assertTrue(all(line.isascii() for line in lines))
+        adv = conduct_advice(1, 0.5)
+        self.assertIn("cautious", adv["posture"])
+        adv2 = conduct_advice(5, 0.99)
+        self.assertEqual(adv2["posture"], "senior")
+
     def test_lazy_accessors_share_instances(self):
         self.assertIs(
             get_tier3_ledger(db_path=self.db_path),
@@ -316,6 +372,25 @@ class TestTier3HighAssuranceSuite(unittest.TestCase):
         )
         self.assertTrue(hits, "expected at least one recalled memory")
         self.assertIn("Gaya laporan", hits[0])
+
+    def test_indonesian_stemmer_expansion(self):
+        from agent.tier3_cognitive_core import expand_query_tokens, stem_indonesian
+
+        # Originals always preserved; stems added; no empties/duplicates.
+        out = expand_query_tokens(["memeriksa", "tuan", "tuan"])
+        self.assertIn("memeriksa", out)
+        self.assertEqual(len(out), len(set(out)))
+        self.assertTrue(all(o for o in out))
+        # Affix stripping works: -nya clitic, -an suffix.
+        self.assertEqual(stem_indonesian("bukunya"), "buku")
+        self.assertEqual(stem_indonesian("minuman"), "minum")
+        # Short words untouched.
+        self.assertEqual(stem_indonesian("kopi"), "kopi")
+
+    def test_stemmed_query_still_recalls(self):
+        self.substrate.distill_and_store("Gaya laporan", "laporkan hasil dalam satu baris", 1.0)
+        hits = self.substrate.query_relevant_soul_memory("bagaimana pelaporan hasilnya")
+        self.assertTrue(any("Gaya laporan" in h for h in hits))
 
     def test_compact_identity_pointer(self):
         from agent.tier3_cognitive_core import compact_identity_pointer

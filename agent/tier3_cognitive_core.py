@@ -251,15 +251,47 @@ class CognitivePoULedger:
         explaining what triggered this exact delta. Stored verbatim so
         `hermes why` can trace every level change to its evidence.
         """
+        now = time.time()
         with _connect(self.db_path) as conn:
             cur = conn.cursor()
-            cur.execute("SELECT cumulative_energy, current_level FROM pou_ledger ORDER BY id DESC LIMIT 1")
+            cur.execute(
+                "SELECT cumulative_energy, current_level, timestamp FROM pou_ledger "
+                "ORDER BY id DESC LIMIT 1"
+            )
             row = cur.fetchone()
             prev_energy = row[0] if row else 0.0
             prev_level = row[1] if row else 1
+            last_ts = row[2] if row and row[2] else now
+
+            cause_parts = [(cause or "unspecified").strip()[:400]]
+
+            # LVL-3: lazy inactivity decay on stored energy (history untouched).
+            idle_days = max(0.0, (now - last_ts) / 86400.0)
+            if row and idle_days >= 1.0:
+                decay = 0.5 ** (idle_days / INACTIVITY_HALVING_DAYS)
+                if decay < 0.999:
+                    prev_energy *= decay
+                    cause_parts.append(
+                        f"inactivity decay x{decay:.2f} ({idle_days:.1f}d idle)"
+                    )
 
             energy_delta = self.calculate_energy_delta(metrics, prev_level)
+
+            # LVL-2: anti-farming throttle on trivial-turn bursts (gains only).
+            if energy_delta > 0:
+                trivial_recent = cur.execute(
+                    "SELECT COUNT(*) FROM pou_ledger WHERE timestamp > ? AND complexity <= ?",
+                    (now - FARMING_WINDOW_SECONDS, AUTO_TURN_MAX_COMPLEXITY),
+                ).fetchone()[0]
+                if trivial_recent >= FARMING_TRIVIAL_COUNT:
+                    energy_delta *= FARMING_GAIN_FACTOR
+                    cause_parts.append(
+                        f"farming-guard x{FARMING_GAIN_FACTOR} "
+                        f"({trivial_recent} trivial turns/h)"
+                    )
+
             new_energy = max(0.0, prev_energy + energy_delta)
+            cause = " | ".join(cause_parts)[:500]
 
             # Evaluate Level Progression
             new_level = prev_level
@@ -286,10 +318,10 @@ class CognitivePoULedger:
                     state_hash, cause, hci
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                time.time(), session_key, metrics.task_complexity, metrics.master_comprehension,
+                now, session_key, metrics.task_complexity, metrics.master_comprehension,
                 metrics.soul_assimilation, metrics.execution_precision, metrics.master_satisfaction,
                 energy_delta, new_energy, new_level, "tier3-verified",
-                (cause or "unspecified").strip()[:500], hci,
+                cause, hci,
             ))
             conn.commit()
 
@@ -312,7 +344,7 @@ class CognitivePoULedger:
                 "current_level": new_level,
                 "level_changed": (new_level != prev_level),
                 "hci": hci,
-                "cause": (cause or "unspecified").strip()[:500],
+                "cause": cause,
                 "level_note": level_note,
             }
 
@@ -323,49 +355,102 @@ def pou_status(db_path: Optional[Path] = None) -> Dict[str, Any]:
     if not path.exists():
         return {"turns": 0, "level": 1, "energy": 0.0,
                 "next_target": CognitivePoULedger.difficulty_target(2),
-                "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet"}
+                "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet",
+                "idle_days": 0.0}
     _ensure_schema(path)
     with _connect(path) as conn:
         cur = conn.cursor()
         turns = cur.execute("SELECT COUNT(*) FROM pou_ledger").fetchone()[0]
         row = cur.execute(
-            "SELECT cumulative_energy, current_level, hci, cause "
+            "SELECT cumulative_energy, current_level, hci, cause, timestamp "
             "FROM pou_ledger ORDER BY id DESC LIMIT 1"
         ).fetchone()
     if not row:
         return {"turns": 0, "level": 1, "energy": 0.0,
                 "next_target": CognitivePoULedger.difficulty_target(2),
-                "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet"}
-    energy, level, hci, cause = row
+                "progress_pct": 0.0, "hci": None, "last_cause": "no turns recorded yet",
+                "idle_days": 0.0}
+    energy, level, hci, cause, last_ts = row
     target = CognitivePoULedger.difficulty_target(level + 1)
+    idle_days = max(0.0, (time.time() - (last_ts or time.time())) / 86400.0)
     return {"turns": turns, "level": level, "energy": energy,
             "next_target": target,
             "progress_pct": max(0.0, min(100.0, 100.0 * energy / target)),
-            "hci": hci, "last_cause": cause or "unspecified"}
+            "hci": hci, "last_cause": cause or "unspecified",
+            "idle_days": idle_days}
 
 
 def pou_why(limit: int = 10, db_path: Optional[Path] = None) -> List[str]:
-    """Last-N ledger explanations for `hermes why` (read-only, deterministic)."""
+    """Last-N ledger explanations for `hermes why` (read-only, deterministic).
+
+    LVL-4 depth: rows are returned oldest-first with level-transition markers
+    (e.g. ">>> LEVEL UP 1->2") plus the exact threshold math that decided it,
+    so every promotion/demotion traces to numbers, not vibes.
+    """
     path = Path(db_path) if db_path is not None else _default_db_path()
     if not path.exists():
         return ["No PoU turns recorded yet."]
     _ensure_schema(path)
     with _connect(path) as conn:
         rows = conn.execute(
-            "SELECT timestamp, energy_delta, cumulative_energy, current_level, cause "
+            "SELECT timestamp, energy_delta, cumulative_energy, current_level, cause, hci "
             "FROM pou_ledger ORDER BY id DESC LIMIT ?",
             (max(1, min(50, limit)),),
         ).fetchall()
     if not rows:
         return ["No PoU turns recorded yet."]
     lines = []
-    for ts, delta, energy, level, cause in rows:
+    prev_level: Optional[int] = None
+    for ts, delta, energy, level, cause, hci in reversed(rows):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts or 0))
-        # ASCII-only: U+0394 (Δ) and em-dash crash Windows cp1252 consoles.
+        # ASCII-only: non-ASCII crashes Windows cp1252 consoles.
+        hci_txt = f"{hci:.3f}" if hci is not None else "n/a"
         lines.append(
-            f"[{when}] L{level} dE{delta:+.1f} (E={energy:.1f}) - {cause or 'unspecified'}"
+            f"[{when}] L{level} dE{delta:+.1f} (E={energy:.1f}, HCI={hci_txt}) "
+            f"- {cause or 'unspecified'}"
         )
-    return lines
+        if prev_level is not None and level != prev_level:
+            direction = "UP" if level > prev_level else "DOWN"
+            tgt = CognitivePoULedger.difficulty_target(level if direction == "UP" else prev_level)
+            lines.append(
+                f"  >>> LEVEL {direction} {prev_level}->{level} "
+                f"(threshold math: E={energy:.1f} vs T={tgt:.1f}, HCI>={0.98})"
+            )
+        prev_level = level
+    return list(reversed(lines))
+
+
+def conduct_advice(level: int, hci: Optional[float]) -> Dict[str, str]:
+    """Advisory autonomy posture derived from PoU standing (pure, no I/O).
+
+    LVL-5: maps level+HCI to how the agent should behave — junior confirms,
+    senior acts — like a human professional ladder. ADVISORY ONLY: it never
+    weakens safety gates; low standing can only add caution, never remove it.
+    """
+    lvl = max(1, int(level or 1))
+    h = float(hci) if hci is not None else 0.0
+    if lvl <= 1:
+        posture = "junior"
+        guidance = (
+            "Show the plan before risky actions and confirm explicitly; "
+            "prefer clarifying questions over guesses."
+        )
+    elif lvl == 2:
+        posture = "associate"
+        guidance = (
+            "Execute routine tasks directly; present the plan first for "
+            "multi-step or destructive-adjacent work."
+        )
+    else:
+        posture = "senior"
+        guidance = (
+            "Execute autonomously within safety invariants; report compactly "
+            "with evidence, flagging only genuine ambiguities."
+        )
+    if h < 0.80:
+        guidance += " Caution override: HCI below 0.80 — verify understanding first."
+        posture += "+cautious"
+    return {"posture": posture, "guidance": guidance}
 
 
 # =============================================================================
@@ -452,8 +537,9 @@ class DynamicSoulMemorySubstrate:
         return scored
 
     def query_relevant_soul_memory(self, task_context: str, limit: int = 3) -> List[str]:
-        """Fetch JIT relevant memory: FTS5 candidates → IDF rescoring → fallback."""
-        tokens = [w.lower() for w in re.findall(r"\w+", task_context or "") if len(w) > 3]
+        """Fetch JIT relevant memory: stem-expanded tokens → FTS5 → IDF rescoring."""
+        raw_tokens = [w.lower() for w in re.findall(r"\w+", task_context or "") if len(w) > 3]
+        tokens = expand_query_tokens(raw_tokens)
         if not tokens:
             return []
 
@@ -556,6 +642,45 @@ class DynamicSoulMemorySubstrate:
         return stored
 
 
+# Lightweight Indonesian stemmer for query expansion (no dependencies).
+# Strips common affixes so "memeriksa"/"pemeriksaan"/"periksa" share the root
+# "periksa", and "-nya"/"-ku"/"-mu" clitics. Applied to QUERY tokens only;
+# stored content is untouched (safe, additive: original token always kept).
+_ID_PREFIXES = ("meng", "meny", "men", "mem", "me", "peng", "peny", "pen", "pem", "per", "ber", "ter", "di", "ke", "se")
+_ID_SUFFIXES = ("kan", "an", "i")
+_ID_CLITICS = ("nya", "ku", "mu")
+
+
+def stem_indonesian(word: str) -> str:
+    """Return a crude root form of an Indonesian word (query-expansion use)."""
+    w = (word or "").lower()
+    for clitic in _ID_CLITICS:
+        if len(w) > len(clitic) + 3 and w.endswith(clitic):
+            w = w[: -len(clitic)]
+            break
+    for suffix in _ID_SUFFIXES:
+        if len(w) > len(suffix) + 3 and w.endswith(suffix):
+            w = w[: -len(suffix)]
+            break
+    for prefix in _ID_PREFIXES:
+        if len(w) > len(prefix) + 3 and w.startswith(prefix):
+            w = w[len(prefix):]
+            break
+    return w or word.lower()
+
+
+def expand_query_tokens(tokens: List[str]) -> List[str]:
+    """Original tokens plus stemmed variants (deduped, order-stable)."""
+    expanded: List[str] = []
+    for t in tokens:
+        if t not in expanded:
+            expanded.append(t)
+        stem = stem_indonesian(t)
+        if stem != t and stem not in expanded:
+            expanded.append(stem)
+    return expanded
+
+
 def compact_identity_pointer(chunk_count: int) -> str:
     """Tiny stable-prompt pointer replacing a re-dumped identity file.
 
@@ -573,6 +698,17 @@ def compact_identity_pointer(chunk_count: int) -> str:
 # real tool-execution signals but neutral judgment values, so the cap keeps
 # them informative without ever inflating leveling on their own.
 AUTO_TURN_MAX_COMPLEXITY = 0.15
+
+# Anti-farming guard: a burst of trivial auto turns inside one hour gets its
+# gains throttled (never its penalties — accountability is never discounted).
+FARMING_WINDOW_SECONDS = 3600.0
+FARMING_TRIVIAL_COUNT = 30
+FARMING_GAIN_FACTOR = 0.5
+
+# Inactivity decay: stored energy halves per full idle period (lazy, applied
+# on record, always disclosed in the cause line). Keeps levels earned, not
+# parked — without wiping history (rows are never deleted).
+INACTIVITY_HALVING_DAYS = 30.0
 
 
 def _turn_tool_stats(messages: List[Dict[str, Any]]) -> Tuple[int, int]:

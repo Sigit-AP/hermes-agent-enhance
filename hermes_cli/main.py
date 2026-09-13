@@ -2096,17 +2096,21 @@ def cmd_setup(args):
 
 def cmd_level(args):
     """Show cognitive mastery level (Tier-3 PoU readout, read-only)."""
-    from agent.tier3_cognitive_core import pou_status
+    from agent.tier3_cognitive_core import conduct_advice, pou_status
 
     st = pou_status()
     bar_len = 24
     filled = int(bar_len * st["progress_pct"] / 100.0)
     bar = "#" * filled + "-" * (bar_len - filled)
-    print(f"Mastery level : {st['level']}")
+    posture = conduct_advice(st["level"], st["hci"])
+    print(f"Mastery level : {st['level']} ({posture['posture']})")
     print(f"Energy        : {st['energy']:.1f} / {st['next_target']:.1f} [{bar}] {st['progress_pct']:.1f}%")
     print(f"Turns recorded: {st['turns']}")
+    if st.get("idle_days", 0.0) >= 1.0:
+        print(f"Idle          : {st['idle_days']:.1f}d (decay applies on next recorded turn)")
     print(f"HCI (last)    : {st['hci'] if st['hci'] is not None else 'n/a'}")
     print(f"Last cause    : {st['last_cause']}")
+    print(f"Posture       : {posture['guidance']}")
     print("Run `hermes why` for the evidence trail.")
 
 
