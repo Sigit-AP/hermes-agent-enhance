@@ -3683,21 +3683,50 @@ def _model_flow_custom(config):
             print(f"  Updated URL: {effective_url}")
         print()
 
-    from hermes_cli.models import probe_api_models
+    # Normalize first: users often paste the full chat endpoint
+    # (.../v1/chat/completions). The API root is what gets saved and probed.
+    from agent.model_auto_inspector import auto_inspect_models, _normalize_api_root
 
-    probe = probe_api_models(effective_key, effective_url)
-    if probe.get("used_fallback") and probe.get("resolved_base_url"):
+    _normalized_root = _normalize_api_root(effective_url)
+    if _normalized_root != effective_url:
         print(
-            f"Warning: endpoint verification worked at {probe['resolved_base_url']}/models, "
-            f"not the exact URL you entered. Saving the working base URL instead."
+            f"  Note: normalized API root to {_normalized_root} "
+            f"(chat path stripped for probing and saving)."
         )
-        effective_url = probe["resolved_base_url"]
+        effective_url = _normalized_root
         if base_url:
             base_url = effective_url
-    elif probe.get("models") is not None:
+
+    # Primary probe: dual-wire inspector (OpenAI + Anthropic shapes,
+    # Bearer + x-api-key auth, 25s timeout for slow gateways).
+    inspection = auto_inspect_models(effective_url, api_key=effective_key, timeout=25.0)
+    detected_specs = inspection.get("models") or []
+    probe = {
+        "models": list(inspection.get("detected_ids") or []),
+        "probed_url": (inspection.get("tried_urls") or [effective_url + "/models"])[0],
+        "resolved_base_url": inspection.get("api_root") or effective_url,
+        "suggested_base_url": None,
+        "used_fallback": False,
+        "specs": detected_specs,
+        "wire": inspection.get("wire") or "unknown",
+    }
+
+    # Legacy fallback: keeps special cases (e.g. GitHub models) working when
+    # the generic inspector finds nothing.
+    if not probe["models"]:
+        from hermes_cli.models import probe_api_models
+
+        legacy = probe_api_models(effective_key, effective_url)
+        if legacy.get("models"):
+            probe = legacy
+            probe.setdefault("specs", [])
+            probe.setdefault("wire", "openai")
+
+    if probe.get("models"):
         print(
             f"Verified endpoint via {probe.get('probed_url')} "
-            f"({len(probe.get('models') or [])} model(s) visible)"
+            f"({len(probe.get('models') or [])} model(s) visible, "
+            f"{probe.get('wire', 'openai')} wire)"
         )
     else:
         print(
@@ -3728,21 +3757,40 @@ def _model_flow_custom(config):
     else:
         print("  API mode: auto-detect")
 
-    # Select model — use probe results when available, fall back to manual input
+    # Select model — use probe results when available, fall back to manual input.
+    # Pure recall: the list is exactly what the provider's /models returned.
     model_name = ""
     detected_models = probe.get("models") or []
+    specs_by_id = {
+        s.get("id"): s
+        for s in (probe.get("specs") or [])
+        if isinstance(s, dict) and s.get("id")
+    }
+
+    def _fmt_ctx_for_picker(m_id: str) -> str:
+        ctx = (specs_by_id.get(m_id) or {}).get("context_length")
+        if isinstance(ctx, int) and ctx > 0:
+            if ctx >= 1000000:
+                return f"{ctx / 1000000:g}M ctx"
+            if ctx >= 1000:
+                return f"{ctx // 1000}k ctx"
+            return f"{ctx} ctx"
+        return ""
+
     try:
         if len(detected_models) == 1:
-            print(f"  Detected model: {detected_models[0]}")
+            _suffix = f" ({_fmt_ctx_for_picker(detected_models[0])})" if _fmt_ctx_for_picker(detected_models[0]) else ""
+            print(f"  Detected model: {detected_models[0]}{_suffix}")
             confirm = input("  Use this model? [Y/n]: ").strip().lower()
             if confirm in {"", "y", "yes"}:
                 model_name = detected_models[0]
             else:
                 model_name = input("Model name (e.g. gpt-4, llama-3-70b): ").strip()
         elif len(detected_models) > 1:
-            print("  Available models:")
+            print("  Available models (directly from provider):")
             for i, m in enumerate(detected_models, 1):
-                print(f"    {i}. {m}")
+                _suffix = f" ({_fmt_ctx_for_picker(m)})" if _fmt_ctx_for_picker(m) else ""
+                print(f"    {i}. {m}{_suffix}")
             pick = input(
                 f"  Select model [1-{len(detected_models)}] or type name: "
             ).strip()
@@ -3753,9 +3801,15 @@ def _model_flow_custom(config):
         else:
             model_name = input("Model name (e.g. gpt-4, llama-3-70b): ").strip()
 
+        _auto_ctx = (specs_by_id.get(model_name) or {}).get("context_length")
+        if isinstance(_auto_ctx, int) and _auto_ctx > 0:
+            print(f"  Discovered context length for {model_name}: {_auto_ctx} tokens.")
         context_length_str = input(
             "Context length in tokens [leave blank for auto-detect]: "
         ).strip()
+        if not context_length_str and isinstance(_auto_ctx, int) and _auto_ctx > 0:
+            context_length_str = str(_auto_ctx)
+            print(f"  Using discovered context length: {context_length_str}")
 
         # Prompt for a display name — shown in the provider menu on future runs
         default_name = _auto_provider_name(effective_url)
