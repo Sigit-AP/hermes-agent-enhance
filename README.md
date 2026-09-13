@@ -200,8 +200,10 @@ Local-first mastery tracking in `~/.hermes/cognitive_state.db` — provider-inde
 ```bash
 hermes level              # level, energy, progress bar, blocking gates, posture
 hermes why -n 10          # evidence trail: every delta traces to its cause
+hermes why --episodes     # trail plus linked episodic turn summaries
 hermes quests             # active missions + completion history
 hermes calibrate          # ledger analytics + tuning recommendations (read-only)
+hermes calibrate --json   # machine-readable calibration output
 hermes level --export f.json --import f.json   # VPS backup / migration
 python3 scripts/pou-measure.py                 # cold-prompt + ledger report (VPS-ready)
 ```
@@ -219,8 +221,8 @@ Rules, all enforced and tested:
 
 | Rule | Behavior |
 | :--- | :--- |
-| Promotion gates | Energy + HCI 0.98 + no-fatal + min 5 turns — blockers shown, never silent |
-| Anti-farming | Burst of 30+ trivial turns/hour throttles gains x0.5; penalties never discounted |
+| Promotion gates | Energy + HCI 0.98 + no-fatal + min 5 turns (`MIN_TURNS_FOR_PROMOTION`) — blockers shown, never silent |
+| Anti-farming | Burst of 30+ trivial turns/hour (`farming-guard`) throttles gains x0.5; penalties never discounted |
 | Inactivity decay | Stored energy halves per 30 idle days (lazy, disclosed in cause + projected read-only) |
 | WHY trail | Deterministic cause per turn; ASCII-safe for Windows consoles |
 | Soul memory | FTS5 + IDF rescoring + Indonesian stemming; SOUL.md re-seeds on change, learnings preserved |
